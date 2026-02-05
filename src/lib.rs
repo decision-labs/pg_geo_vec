@@ -1,0 +1,49 @@
+#![allow(unexpected_cfgs)]
+use pgrx::prelude::*;
+
+pgrx::pg_module_magic!();
+
+pub mod access_method;
+pub mod partition;
+mod util;
+
+/// The name of the extension, for use with code that needs to reference the extension library path.
+const EXTENSION_NAME: *const pgrx::ffi::c_char = {
+    static NAME: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"), "\0");
+    NAME.as_ptr() as *const pgrx::ffi::c_char
+};
+
+#[allow(non_snake_case)]
+#[pg_guard]
+pub unsafe extern "C-unwind" fn _PG_init() {
+    access_method::distance::init();
+    access_method::options::init();
+    access_method::guc::init();
+    // partition::init(); // TODO: Add GUCs for spatial partitioning
+}
+
+#[allow(non_snake_case)]
+#[pg_guard]
+pub extern "C-unwind" fn _PG_fini() {
+    // noop
+}
+
+/// This module is required by `cargo pgrx test` invocations.
+/// It must be visible at the root of your extension crate.
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {
+        //let (mut client, _) = pgrx_tests::client().unwrap();
+
+        // perform one-off initialization when the pg_test framework starts
+    }
+
+    #[cfg(feature = "build_parallel")]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec!["maintenance_work_mem = '640MB'"]
+    }
+    #[cfg(not(feature = "build_parallel"))]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec![]
+    }
+}

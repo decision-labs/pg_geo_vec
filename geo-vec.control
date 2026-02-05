@@ -1,0 +1,6 @@
+comment = 'pg_geo_vec access method for composite vector + spatial search'
+default_version = '@CARGO_VERSION@'
+#module_pathname = '$libdir/pg_geo_vec'
+relocatable = false
+superuser = true
+requires = 'postgis'
