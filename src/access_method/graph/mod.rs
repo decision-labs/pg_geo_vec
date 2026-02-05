@@ -326,36 +326,9 @@ impl<'a> Graph<'a> {
         visited_nodes
     }
 
-    /// Returns a ListSearchResult initialized for streaming. The output should be used with greedy_search_iterate to obtain
-    /// the next elements.
-    pub fn greedy_search_streaming_init<S: Storage>(
-        &mut self,
-        query: LabeledVector,
-        search_list_size: usize,
-        storage: &S,
-    ) -> ListSearchResult<S::QueryDistanceMeasure, S::LSNPrivateData> {
-        let start_nodes = self.get_start_nodes();
-        if start_nodes.is_none() {
-            //no nodes in the graph
-            return ListSearchResult::empty();
-        }
-        let start_nodes = start_nodes.unwrap().get_for_node(query.labels());
-        let dm = storage.get_query_distance_measure(query);
-        let num_neighbors = self.meta_page.get_num_neighbors();
-        ListSearchResult::new(
-            start_nodes,
-            dm,
-            None,
-            search_list_size,
-            num_neighbors,
-            self.get_neighbor_store(),
-            storage,
-        )
-    }
-
     /// Returns a ListSearchResult initialized for streaming with partition-aware start nodes.
-    /// If partition_ids are provided and partition start nodes exist, uses those as entry points.
-    /// Otherwise falls back to regular start nodes.
+    /// If partition_ids are provided, the search is restricted to those partitions.
+    /// If none of those partitions has a start node, the result is empty.
     pub fn greedy_search_streaming_init_partitioned<S: Storage>(
         &mut self,
         query: LabeledVector,
@@ -363,38 +336,40 @@ impl<'a> Graph<'a> {
         partition_ids: Option<&[u32]>,
         storage: &S,
     ) -> ListSearchResult<S::QueryDistanceMeasure, S::LSNPrivateData> {
-        // Try to get partition-aware start nodes if partitions are specified
-        let start_nodes = if let Some(ids) = partition_ids {
+        // If partition IDs are provided, treat them as a strict filter.
+        if let Some(ids) = partition_ids {
             if let Some(partition_start_nodes) = self.meta_page.get_partition_start_nodes() {
                 let nodes = partition_start_nodes.get_for_partitions(Some(ids));
-                if !nodes.is_empty() {
-                    pgrx::debug1!(
-                        "Using {} partition start nodes for {} partitions",
-                        nodes.len(),
-                        ids.len()
-                    );
-                    Some(nodes)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Fall back to regular start nodes if no partition nodes available
-        let start_nodes = match start_nodes {
-            Some(nodes) => nodes,
-            None => {
-                let regular_start = self.get_start_nodes();
-                if regular_start.is_none() {
+                if nodes.is_empty() {
                     return ListSearchResult::empty();
                 }
-                regular_start.unwrap().get_for_node(query.labels())
+                pgrx::debug1!(
+                    "Using {} partition start nodes for {} partitions",
+                    nodes.len(),
+                    ids.len()
+                );
+
+                let dm = storage.get_query_distance_measure(query);
+                let num_neighbors = self.meta_page.get_num_neighbors();
+                return ListSearchResult::new(
+                    nodes,
+                    dm,
+                    None,
+                    search_list_size,
+                    num_neighbors,
+                    self.get_neighbor_store(),
+                    storage,
+                );
             }
-        };
+            return ListSearchResult::empty();
+        }
+
+        // Fall back to regular start nodes if no partition nodes available
+        let regular_start = self.get_start_nodes();
+        if regular_start.is_none() {
+            return ListSearchResult::empty();
+        }
+        let start_nodes = regular_start.unwrap().get_for_node(query.labels());
 
         let dm = storage.get_query_distance_measure(query);
         let num_neighbors = self.meta_page.get_num_neighbors();
@@ -458,7 +433,7 @@ impl<'a> Graph<'a> {
         stats.num_neighbors_before_prune += candidates.len();
         //TODO remove deleted nodes
 
-        //TODO diskann has something called max_occlusion_size/max_candidate_size(default:750). Do we need to implement?
+        //TODO geo_vec has something called max_occlusion_size/max_candidate_size(default:750). Do we need to implement?
 
         //sort by distance
         candidates.sort();

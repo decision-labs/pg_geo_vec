@@ -1,218 +1,135 @@
 # pg_geo_vec
 
-A PostgreSQL extension providing a **composite index** that efficiently combines **vector similarity search** with **spatial (geometry) filtering**.
+`pg_geo_vec` is a PostgreSQL extension that adds geospatial-aware behavior to graph-based vector indexing.
 
-## Overview
+It uses the `geo_vec` access method and combines:
+- vector ANN search (`ORDER BY embedding <->|<=> query_vec`)
+- spatial pruning from PostGIS geometry bounding boxes (`geom && envelope`)
 
-pg_geo_vec extends PostgreSQL's indexing capabilities by creating a unified index structure that integrates:
-- **Vector similarity search** (via StreamingDiskANN/HNSW graphs)
-- **Spatial filtering** (via bounding box partitioning)
+This is intended for queries like:
+- "find nearest similar points inside this map window"
+- "semantic nearest neighbors, but only in this region"
 
-This enables efficient queries combining both spatial and semantic similarity:
-- "Find restaurants similar to this one, within 10km"
-- "Find places like this, in this city"
+## What It Does
 
-## Architecture
+- Stores per-row geometry bounding boxes alongside vector nodes.
+- Builds spatial partitions (uniform grid) from global geometry extent.
+- Restricts graph start nodes to overlapping partitions at query time.
+- Fails fast when the required PostGIS bbox helper API is unavailable.
 
-```
-┌─────────────────────────────────────────┐
-│           pg_geo_vec Index               │
-├─────────────────────────────────────────┤
-│  Meta Page                              │
-│  ├─ Vector dimension, distance type     │
-│  ├─ Number of partitions                │
-│  ├─ Global bbox (union of all)          │
-│  └─ Partition metadata array            │
-├─────────────────────────────────────────┤
-│  Partition 0 (Spatial Region)           │
-│  ├─ Partition bbox                      │
-│  └─ StreamingDiskANN Graph              │
-│     └─ Nodes: (vector + bbox + neighbors)│
-├─────────────────────────────────────────┤
-│  Partition 1 (Spatial Region)           │
-│  ...                                    │
-└─────────────────────────────────────────┘
-```
+## Requirements
 
-## Key Features
+- PostgreSQL 17+ (project currently validated on pg17)
+- Rust toolchain
+- `cargo-pgrx`
+- PostGIS
+- Vector type support (`vector` type/opclasses used in index examples)
 
-- **Composite Index**: Single index handles both vector and spatial queries
-- **Spatial Partitioning**: Data divided by geographic regions using bbox
-- **BBox Filtering**: Each node stores its bounding box for fast spatial filtering
-- **StreamingDiskANN**: Efficient graph-based vector search
-- **Parallel Build**: Multi-worker index construction
-- **PostGIS Integration**: Uses `gserialized_get_gbox_p()` for bbox extraction
-
-## Implementation Status
-
-| Component | Status | Notes |
-|----------|--------|-------|
-| BBox2D struct | ✅ Done | 16-byte bbox with rkyv derives |
-| PostGIS FFI | ✅ Done | `gserialized_get_gbox_p()` bindings |
-| PlainNode + bbox | ✅ Done | Added `bbox` field |
-| SbqNode + bbox | ✅ Done | Added `bbox` field |
-| Storage trait | ✅ Done | `create_node(bbox)` updated |
-| Partition metadata | ✅ Done | `PartitionMetadata` struct |
-| Spatial partitioning | 🔄 In Progress | Grid/Quadtree logic |
-| BBox filtering in search | ⏳ Pending | Graph traversal filter |
-| Partition selection | ⏳ Pending | Query bbox → partitions |
-
-## Installation
-
-### Prerequisites
-
-- PostgreSQL 17+
-- Rust 1.70+
-- cargo-pgrx (`cargo install cargo-pgrx`)
-- PostGIS extension
-
-### Build
+## Build And Install
 
 ```bash
 cargo pgrx init --pg17 /path/to/pg_config
-cargo pgrx install --release
+cargo pgrx install --features pg17 --no-default-features
 ```
 
-### Usage
+## SQL Setup
 
 ```sql
--- Create extension
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS geo_vec;
+```
 
--- Create table with vector and geometry
+Create a geometry opclass for spatial filtering (if not already created):
+
+```sql
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_opclass c
+        JOIN pg_am a ON a.oid = c.opcmethod
+        WHERE c.opcname = 'geometry_geo_vec_ops'
+          AND a.amname = 'geo_vec'
+    ) THEN
+        CREATE OPERATOR CLASS geometry_geo_vec_ops
+        FOR TYPE geometry USING geo_vec AS
+        OPERATOR 1 && (geometry, geometry);
+    END IF;
+END;
+$$;
+```
+
+## Example
+
+```sql
 CREATE TABLE places (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    embedding vector(1536),
+    id bigserial PRIMARY KEY,
+    embedding vector(3),
     geom geometry(Point, 4326)
 );
 
--- Create composite index
-CREATE INDEX idx_places_geo_vec
-ON places USING geo_vec (embedding, geom)
-WITH (num_partitions = 64);
+CREATE INDEX idx_places_geo
+ON places
+USING geo_vec (embedding vector_l2_ops, geom geometry_geo_vec_ops)
+WITH (
+    num_neighbors = 50,
+    search_list_size = 100,
+    storage_layout = 'memory_optimized'
+);
 
--- Query with spatial + vector filters
-SELECT id, name,
-       embedding <=> query_vector AS distance
+-- Spatial + vector query
+SELECT id,
+       embedding <-> '[0.1, 0.2, 0.3]'::vector(3) AS dist
 FROM places
 WHERE geom && ST_MakeEnvelope(-122.5, 37.5, -122.0, 38.0, 4326)
-ORDER BY embedding <=> query_vector
-LIMIT 10;
+ORDER BY embedding <-> '[0.1, 0.2, 0.3]'::vector(3)
+LIMIT 20;
 ```
 
-## How It Works
+## Index Options
 
-### 1. Index Build
+The index supports standard DiskANN options used by this extension:
 
-```rust
-// For each tuple in the table:
-fn build_callback(values, isnull) {
-    // Extract vector from first column
-    let vector = extract_vector(values[0]);
+- `storage_layout`: `plain` or `memory_optimized` (alias for bq compression)
+- `num_neighbors`: max graph out-degree (`-1` uses default)
+- `search_list_size`: build/search candidate width
+- `num_dimensions`: index first N dimensions (`0` = all)
+- `num_bits_per_dimension`: compression bits per dimension
+- `max_alpha`: pruning aggressiveness during build
 
-    // Extract bbox from geometry using PostGIS
-    let bbox = unsafe {
-        postgis_extract_bbox(values[1])  // Calls gserialized_get_gbox_p()
-    };
+## Spatial Behavior
 
-    // Store node with vector + bbox
-    storage.create_node(vector, bbox, heap_ptr, meta_page);
+At build time:
+- The extension extracts geometry bboxes via PostGIS datum helper APIs.
+- It computes a global bbox and derives a grid partitioner.
+- Rows are assigned to partitions, and partition metadata is written to meta pages.
 
-    // Assign to partition based on bbox
-    let partition = partition_manager.get_partition(bbox);
-}
+At query time:
+- The `&&` geometry predicate bbox is read from scan keys.
+- Overlapping partitions are selected.
+- Search is restricted to start nodes from those partitions.
+
+## Limitations
+
+- Spatial pruning depends on a geometry bbox helper symbol provided by PostGIS at runtime.
+- Current testing focus is pg17.
+- `cargo pgrx test` may require write access to PostgreSQL extension install paths in your environment.
+
+## Development
+
+Useful commands:
+
+```bash
+RUSTFLAGS='-C target-feature=+avx2,+fma' cargo check --no-default-features --features pg17
+RUSTFLAGS='-C target-feature=+avx2,+fma' cargo test --no-default-features --features pg17 --no-run
 ```
 
-### 2. Node Storage
+## Project Layout
 
-```rust
-struct PlainNode {
-    vector: Vec<f32>,      // embedding
-    bbox: BBox2D,          // 16 bytes: xmin, xmax, ymin, ymax
-    neighbors: Vec<u32>,    // graph neighbors
-    heap_ptr: ItemPointer,  // back to heap tuple
-}
-```
-
-### 3. Query Processing
-
-```sql
-SELECT * FROM places
-WHERE geom && ST_MakeEnvelope(...)    -- PostGIS spatial filter
-ORDER BY embedding <=> query_vec       -- Vector similarity
-LIMIT 10;
-```
-
-```
-Query Flow:
-┌─────────────────────────────────────────┐
-│ Parse query                              │
-│ - Extract query vector                  │
-│ - Extract query bbox from ST_MakeEnvelope│
-└─────────────────────────────────────────┘
-                    ▼
-┌─────────────────────────────────────────┐
-│ Phase 1: Find overlapping partitions   │
-│                                         │
-│  Check each partition's bbox:           │
-│  ├─ Partition 0: bbox overlaps? YES ✓   │
-│  ├─ Partition 1: bbox overlaps? YES ✓   │
-│  └─ Partition 2: bbox overlaps? NO ✗    │
-│                                         │
-│  Result: Search only partitions 0, 1     │
-└─────────────────────────────────────────┘
-                    ▼
-┌─────────────────────────────────────────┐
-│ Phase 2: Search graphs (per partition)  │
-│                                         │
-│  For each candidate node:                │
-│  if node.bbox.overlaps(query_bbox) {     │
-│      compute_distance(vector, query)     │
-│  } else {                               │
-│      skip_node()  // Skip non-matching!  │
-│  }                                      │
-└─────────────────────────────────────────┘
-                    ▼
-┌─────────────────────────────────────────┐
-│ Phase 3: Merge results                 │
-│  Return top-K by distance               │
-└─────────────────────────────────────────┘
-```
-
-## Project Structure
-
-```
-pg_geo_vec/
-├── src/
-│   ├── lib.rs                    # Extension entry point
-│   ├── partition/
-│   │   ├── mod.rs               # BBox2D, Partition, PartitionManager
-│   │   └── postgis.rs           # PostGIS FFI bindings
-│   ├── access_method/
-│   │   ├── mod.rs               # Access method handler
-│   │   ├── build.rs             # Index build (ambuild)
-│   │   ├── scan.rs              # Index scan (amgettuple)
-│   │   ├── meta_page.rs         # Meta page with partition metadata
-│   │   ├── plain/
-│   │   │   └── node.rs          # PlainNode with bbox
-│   │   ├── sbq/
-│   │   │   └── node.rs          # SbqNode with bbox
-│   │   └── graph/               # StreamingDiskANN graph
-│   └── access_method/
-│       └── partition_metadata.rs  # PartitionMetadata, PartitionConfig
-├── sql/
-│   └── geo-vec--0.1.0.sql       # SQL definitions
-└── pg_geo_vec_derive/            # Derive macros
-```
-
-## Reference Implementations
-
-- **pgvectorscale**: Rust/pgrx access method patterns, StreamingDiskANN
-- **pgvector**: HNSW algorithms, distance functions
-- **PostGIS**: GiST patterns, `gserialized_get_gbox_p()`
+- `src/access_method/`: AM build/scan/graph/meta-page logic
+- `src/partition/`: bbox model, grid partitioning, PostGIS bbox extraction
+- `sql/`: extension SQL definitions
 
 ## License
 
-MIT or Apache 2.0
+MIT OR Apache-2.0

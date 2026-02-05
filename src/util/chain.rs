@@ -199,7 +199,7 @@ mod tests {
             "CREATE TABLE test(encoding vector(3));
         CREATE INDEX idxtest
                   ON test
-               USING diskann(encoding)
+               USING geo_vec(encoding)
                 WITH (num_neighbors=30);",
         )
         .unwrap();

@@ -9,7 +9,7 @@ pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(
 
 pub fn init() {
     GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("diskann.query_search_list_size".as_pg_cstr()) },
+        unsafe { std::ffi::CStr::from_ptr("geo_vec.query_search_list_size".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr("The size of the search list used in queries".as_pg_cstr())
         },
@@ -26,7 +26,7 @@ pub fn init() {
     );
 
     GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("diskann.query_rescore".as_pg_cstr()) },
+        unsafe { std::ffi::CStr::from_ptr("geo_vec.query_rescore".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr(
                 "The number of elements rescored (0 to disable rescoring)".as_pg_cstr(),
@@ -43,7 +43,7 @@ pub fn init() {
     );
 
     GucRegistry::define_float_guc(
-        unsafe { std::ffi::CStr::from_ptr("diskann.parallel_flush_interval".as_pg_cstr()) },
+        unsafe { std::ffi::CStr::from_ptr("geo_vec.parallel_flush_interval".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr("The fraction of total vectors processed before flushing neighbor cache in parallel builds".as_pg_cstr())
         },
@@ -59,7 +59,7 @@ pub fn init() {
 
     GucRegistry::define_int_guc(
         unsafe {
-            std::ffi::CStr::from_ptr("diskann.parallel_initial_start_nodes_count".as_pg_cstr())
+            std::ffi::CStr::from_ptr("geo_vec.parallel_initial_start_nodes_count".as_pg_cstr())
         },
         unsafe {
             std::ffi::CStr::from_ptr(
@@ -78,7 +78,7 @@ pub fn init() {
     );
 
     GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("diskann.min_vectors_for_parallel_build".as_pg_cstr()) },
+        unsafe { std::ffi::CStr::from_ptr("geo_vec.min_vectors_for_parallel_build".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr(
                 "Minimum number of vectors required to enable parallel building".as_pg_cstr(),
@@ -95,7 +95,7 @@ pub fn init() {
     );
 
     GucRegistry::define_int_guc(
-        unsafe { std::ffi::CStr::from_ptr("diskann.force_parallel_workers".as_pg_cstr()) },
+        unsafe { std::ffi::CStr::from_ptr("geo_vec.force_parallel_workers".as_pg_cstr()) },
         unsafe {
             std::ffi::CStr::from_ptr(
                 "Force a specific number of parallel workers for index builds".as_pg_cstr(),

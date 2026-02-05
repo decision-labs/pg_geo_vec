@@ -1,8 +1,8 @@
 use std::pin::Pin;
 
+use pg_geo_vec_derive::{Readable, Writeable};
 use pgrx::pg_sys::{InvalidBlockNumber, InvalidOffsetNumber};
 use pgrx::*;
-use pg_geo_vec_derive::{Readable, Writeable};
 use rkyv::vec::ArchivedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 

@@ -32,7 +32,7 @@ pub mod tests {
                     labels SMALLINT[]
                 );
 
-                CREATE INDEX idx_null_labels ON test_null_labels USING diskann (embedding, labels);
+                CREATE INDEX idx_null_labels ON test_null_labels USING geo_vec (embedding, labels);
 
                 -- Insert data with various label scenarios
                 INSERT INTO test_null_labels (embedding, labels) VALUES
@@ -132,7 +132,7 @@ pub mod tests {
         )?;
 
         // Now create the index on the non-empty table
-        Spi::run("CREATE INDEX idx_nonempty ON test_nonempty USING diskann (embedding, labels);")?;
+        Spi::run("CREATE INDEX idx_nonempty ON test_nonempty USING geo_vec (embedding, labels);")?;
 
         // Test 1: Basic label filtering
         let res: Option<i64> = Spi::get_one(
@@ -179,7 +179,7 @@ pub mod tests {
                     category TEXT
                 );
 
-                CREATE INDEX idx_mixed_labels ON test_mixed_labels USING diskann (embedding, labels);
+                CREATE INDEX idx_mixed_labels ON test_mixed_labels USING geo_vec (embedding, labels);
 
                 -- Insert data with mixed scenarios
                 INSERT INTO test_mixed_labels (embedding, labels, category) VALUES
@@ -230,7 +230,7 @@ pub mod tests {
                 ('[4,5,6]', '{3,4}');
 
                 -- Create index on non-empty table
-                CREATE INDEX idx_update_labels ON test_update_labels USING diskann (embedding, labels);
+                CREATE INDEX idx_update_labels ON test_update_labels USING geo_vec (embedding, labels);
                 ",
             )?;
 
@@ -300,7 +300,7 @@ pub mod tests {
             category TEXT
         );
 
-        CREATE INDEX idx_labeled_diskann ON test_labeled USING diskann (embedding, labels);
+        CREATE INDEX idx_labeled_geo_vec ON test_labeled USING geo_vec (embedding, labels);
 
         INSERT INTO test_labeled (embedding, labels, category) VALUES
         ('[1,2,3]', '{1,2}', 'article'),
@@ -353,7 +353,7 @@ pub mod tests {
             embedding vector(3)
         );
 
-        CREATE INDEX idx_unusual_order ON test_unusual_order USING diskann (embedding, labels);
+        CREATE INDEX idx_unusual_order ON test_unusual_order USING geo_vec (embedding, labels);
 
         INSERT INTO test_unusual_order (embedding, labels, comments) VALUES
         ('[1,2,3]', '{1,2}', 'This is a comment'),
@@ -388,7 +388,7 @@ pub mod tests {
             labels SMALLINT[]
         );
 
-        CREATE INDEX idx_complex_order_by ON test_complex_order_by USING diskann (embedding, labels);
+        CREATE INDEX idx_complex_order_by ON test_complex_order_by USING geo_vec (embedding, labels);
 
         INSERT INTO test_complex_order_by (embedding, labels) VALUES
         ('[1,2,3]', '{1,2}'),
@@ -528,7 +528,7 @@ pub mod tests {
             description TEXT
         );
 
-        CREATE INDEX idx_labeled_diskann ON test_labeled USING diskann (embedding, labels);
+        CREATE INDEX idx_labeled_geo_vec ON test_labeled USING geo_vec (embedding, labels);
 
         INSERT INTO label_definitions (id, name, description) VALUES
         (1, 'science', 'Scientific content'),
@@ -599,7 +599,7 @@ pub mod tests {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE INDEX idx_labeled_diskann ON test_labeled USING diskann (embedding, labels);
+        CREATE INDEX idx_labeled_geo_vec ON test_labeled USING geo_vec (embedding, labels);
 
         INSERT INTO test_labeled (embedding, labels, category) VALUES
         ('[1,2,3]', '{1,2}', 'article'),
@@ -666,7 +666,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding)
+               USING geo_vec(embedding)
                 WITH (num_neighbors=15, search_list_size=10);
 
             INSERT INTO test(embedding, labels) VALUES ('[1,2,3]', '{1,2}'), ('[4,5,6]', '{1,3}'), ('[7,8,10]', '{2,3}');
@@ -722,7 +722,7 @@ pub mod tests {
 
             CREATE INDEX idx_label_bounds
                   ON test_label_bounds
-               USING diskann(embedding, labels);
+               USING geo_vec(embedding, labels);
 
             -- These inserts should succeed (labels within smallint bounds)
             INSERT INTO test_label_bounds(embedding, labels) VALUES ('[1,2,3]', '{0,32767}');
@@ -948,7 +948,7 @@ pub mod tests {
         .unwrap();
 
         // Create the index
-        Spi::run("CREATE INDEX idx_recall ON test_recall USING diskann (embedding, labels);")?;
+        Spi::run("CREATE INDEX idx_recall ON test_recall USING geo_vec (embedding, labels);")?;
 
         // Run queries with index and compute recall
         let compute_recall = |ground_truth: &[String], query: &str| -> f64 {

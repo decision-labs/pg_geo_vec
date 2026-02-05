@@ -137,7 +137,8 @@ impl Storage for PlainStorage<'_> {
         stats: &mut S,
     ) -> ItemPointer {
         //OPT: avoid the clone?
-        let node = PlainNode::new_for_full_vector(full_vector.to_vec(), bbox, heap_pointer, meta_page);
+        let node =
+            PlainNode::new_for_full_vector(full_vector.to_vec(), bbox, heap_pointer, meta_page);
         let index_pointer: IndexPointer = node.write(tape, stats);
         index_pointer
     }

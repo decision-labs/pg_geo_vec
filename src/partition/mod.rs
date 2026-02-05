@@ -7,7 +7,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 /// Bounding box structure (similar to PostGIS BOX2DF)
 /// 16 bytes: 4 x f32 coordinates (xmin, xmax, ymin, ymax)
-#[derive(Copy, Clone, Debug, Archive, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Archive, Deserialize, Serialize)]
 #[repr(C)]
 pub struct BBox2D {
     pub xmin: f32,
@@ -18,7 +18,12 @@ pub struct BBox2D {
 
 impl BBox2D {
     pub fn new(xmin: f32, xmax: f32, ymin: f32, ymax: f32) -> Self {
-        Self { xmin, xmax, ymin, ymax }
+        Self {
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+        }
     }
 
     pub fn empty() -> Self {
@@ -38,14 +43,18 @@ impl BBox2D {
     /// Used for both partition selection and node filtering
     #[inline(always)]
     pub fn overlaps(&self, other: &BBox2D) -> bool {
-        !(self.xmax < other.xmin || other.xmax < self.xmin ||
-          self.ymax < other.ymin || other.ymax < self.ymin)
+        !(self.xmax < other.xmin
+            || other.xmax < self.xmin
+            || self.ymax < other.ymin
+            || other.ymax < self.ymin)
     }
 
     #[inline(always)]
     pub fn contains(&self, other: &BBox2D) -> bool {
-        self.xmin <= other.xmin && self.xmax >= other.xmax &&
-        self.ymin <= other.ymin && self.ymax >= other.ymax
+        self.xmin <= other.xmin
+            && self.xmax >= other.xmax
+            && self.ymin <= other.ymin
+            && self.ymax >= other.ymax
     }
 
     #[inline(always)]
@@ -59,7 +68,9 @@ impl BBox2D {
     }
 
     pub fn area(&self) -> f32 {
-        if self.is_empty() { 0.0 } else {
+        if self.is_empty() {
+            0.0
+        } else {
             (self.xmax - self.xmin) * (self.ymax - self.ymin)
         }
     }
@@ -101,14 +112,12 @@ impl Partition {
 /// Partition manager for spatial partitioning
 pub struct PartitionManager {
     partitions: Vec<Partition>,
-    max_partitions: u32,
 }
 
 impl PartitionManager {
-    pub fn new(max_partitions: u32) -> Self {
+    pub fn new(_max_partitions: u32) -> Self {
         Self {
             partitions: Vec::new(),
-            max_partitions,
         }
     }
 
@@ -198,9 +207,12 @@ impl GridPartitioner {
     /// Get the cell index for a given point
     #[inline(always)]
     pub fn cell_index(&self, x: f32, y: f32) -> u32 {
-        let col = ((x - self.xmin) / (self.xmax - self.xmin) * self.grid_cols as f32)
+        let width = (self.xmax - self.xmin).max(1e-6);
+        let height = (self.ymax - self.ymin).max(1e-6);
+
+        let col = ((x - self.xmin) / width * self.grid_cols as f32)
             .clamp(0.0, self.grid_cols as f32 - 1.0) as u32;
-        let row = ((y - self.ymin) / (self.ymax - self.ymin) * self.grid_rows as f32)
+        let row = ((y - self.ymin) / height * self.grid_rows as f32)
             .clamp(0.0, self.grid_rows as f32 - 1.0) as u32;
         row * self.grid_cols + col
     }
@@ -229,15 +241,22 @@ impl GridPartitioner {
 
     /// Find all cells that overlap with a query bbox
     pub fn overlapping_cells(&self, query_bbox: &BBox2D) -> Vec<u32> {
-        // Find the range of cells that overlap with the query bbox
-        let min_col = (((query_bbox.xmin - self.xmin) / (self.xmax - self.xmin) * self.grid_cols as f32)
-            .floor() as i32).max(0) as u32;
-        let max_col = (((query_bbox.xmax - self.xmin) / (self.xmax - self.xmin) * self.grid_cols as f32)
-            .ceil() as i32).min(self.grid_cols as i32) as u32;
-        let min_row = (((query_bbox.ymin - self.ymin) / (self.ymax - self.ymin) * self.grid_rows as f32)
-            .floor() as i32).max(0) as u32;
-        let max_row = (((query_bbox.ymax - self.ymin) / (self.ymax - self.ymin) * self.grid_rows as f32)
-            .ceil() as i32).min(self.grid_rows as i32) as u32;
+        let width = (self.xmax - self.xmin).max(1e-6);
+        let height = (self.ymax - self.ymin).max(1e-6);
+
+        // Compute inclusive cell ranges and clamp to valid cell coordinates.
+        let min_col = (((query_bbox.xmin - self.xmin) / width * self.grid_cols as f32).floor()
+            as i32)
+            .clamp(0, self.grid_cols as i32 - 1) as u32;
+        let max_col = (((query_bbox.xmax - self.xmin) / width * self.grid_cols as f32).floor()
+            as i32)
+            .clamp(0, self.grid_cols as i32 - 1) as u32;
+        let min_row = (((query_bbox.ymin - self.ymin) / height * self.grid_rows as f32).floor()
+            as i32)
+            .clamp(0, self.grid_rows as i32 - 1) as u32;
+        let max_row = (((query_bbox.ymax - self.ymin) / height * self.grid_rows as f32).floor()
+            as i32)
+            .clamp(0, self.grid_rows as i32 - 1) as u32;
 
         let mut cells = Vec::new();
         for row in min_row..=max_row {
@@ -260,8 +279,8 @@ impl GridPartitioner {
 impl BBox2D {
     /// Expand the bounds by a small percentage
     pub fn expand_bounds(&self, percent: f32) -> Self {
-        let dx = (self.xmax - self.xmin) * percent;
-        let dy = (self.ymax - self.ymin) * percent;
+        let dx = ((self.xmax - self.xmin) * percent).max(1e-6);
+        let dy = ((self.ymax - self.ymin) * percent).max(1e-6);
         Self::new(
             self.xmin - dx,
             self.xmax + dx,

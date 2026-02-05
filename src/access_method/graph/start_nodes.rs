@@ -31,7 +31,11 @@ impl PartitionStartNodes {
     }
 
     /// Set the start node for a partition. Returns the previous node if one existed.
-    pub fn set_partition_start(&mut self, partition_id: u32, node: ItemPointer) -> Option<ItemPointer> {
+    pub fn set_partition_start(
+        &mut self,
+        partition_id: u32,
+        node: ItemPointer,
+    ) -> Option<ItemPointer> {
         // Also update default node if this is the first partition
         if self.default_node.is_none() {
             self.default_node = Some(node);
@@ -41,22 +45,13 @@ impl PartitionStartNodes {
 
     /// Get start nodes for a set of partitions.
     /// Returns the start nodes for all specified partitions that have start nodes.
-    /// If no partitions are specified or no partition nodes are found, returns the default node.
+    /// If no partitions are specified, returns the default node.
     pub fn get_for_partitions(&self, partition_ids: Option<&[u32]>) -> Vec<ItemPointer> {
         match partition_ids {
-            Some(ids) if !ids.is_empty() => {
-                let nodes: Vec<ItemPointer> = ids
-                    .iter()
-                    .filter_map(|id| self.partition_nodes.get(id).copied())
-                    .collect();
-
-                // If no partition nodes found, fall back to default
-                if nodes.is_empty() {
-                    self.default_node.iter().copied().collect()
-                } else {
-                    nodes
-                }
-            }
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| self.partition_nodes.get(id).copied())
+                .collect(),
             _ => {
                 // No partition filter - return default node if available
                 self.default_node.iter().copied().collect()

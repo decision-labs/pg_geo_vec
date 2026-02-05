@@ -14,7 +14,7 @@ use crate::access_method::graph::Graph;
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
-use crate::partition::postgis::postgis_extract_bbox;
+use crate::partition::postgis::{ensure_postgis_bbox_api, postgis_extract_bbox};
 use crate::util::ports::acquire_index_lock;
 
 use crate::access_method::GEO_VEC_DISTANCE_TYPE_PROC;
@@ -33,7 +33,7 @@ use super::sbq::storage::SbqSpeedupStorage;
 
 use super::graph::start_nodes::PartitionStartNodes;
 use super::meta_page::MetaPage;
-use super::partition_metadata::GlobalBBox;
+use super::partition_metadata::{GlobalBBox, PartitionMetadata};
 use crate::partition::GridPartitioner;
 
 use super::plain::storage::PlainStorage;
@@ -165,7 +165,7 @@ impl<'a> PartitionedBuildState<'a> {
         let num_cells = partitioner.num_cells() as usize;
 
         PartitionedBuildState {
-            memcxt: PgMemoryContexts::new("diskann partitioned build context"),
+            memcxt: PgMemoryContexts::new("geo_vec partitioned build context"),
             ntuples: 0,
             tape,
             graph,
@@ -184,7 +184,8 @@ impl<'a> PartitionedBuildState<'a> {
     /// Update the partition start node if this is the first node in the partition
     fn maybe_update_partition_start(&mut self, partition_id: u32, index_pointer: ItemPointer) {
         if !self.partition_start_nodes.has_partition(partition_id) {
-            self.partition_start_nodes.set_partition_start(partition_id, index_pointer);
+            self.partition_start_nodes
+                .set_partition_start(partition_id, index_pointer);
         }
         // Update partition count
         if (partition_id as usize) < self.partition_counts.len() {
@@ -193,7 +194,14 @@ impl<'a> PartitionedBuildState<'a> {
     }
 
     /// Convert to regular BuildState (for finalization)
-    fn into_build_state(self) -> (BuildState<'a>, PartitionStartNodes, Vec<u64>) {
+    fn into_build_state(
+        self,
+    ) -> (
+        BuildState<'a>,
+        PartitionStartNodes,
+        Vec<u64>,
+        GridPartitioner,
+    ) {
         let build_state = BuildState {
             memcxt: self.memcxt,
             ntuples: self.ntuples,
@@ -201,13 +209,21 @@ impl<'a> PartitionedBuildState<'a> {
             graph: self.graph,
             stats: self.stats,
         };
-        (build_state, self.partition_start_nodes, self.partition_counts)
+        (
+            build_state,
+            self.partition_start_nodes,
+            self.partition_counts,
+            self.partitioner,
+        )
     }
 }
 
 /// Storage build state for partitioned builds
 enum StorageBuildStatePartitioned<'a, 'b, 'c, 'd> {
-    SbqSpeedup(&'a mut SbqSpeedupStorage<'b>, &'c mut PartitionedBuildState<'d>),
+    SbqSpeedup(
+        &'a mut SbqSpeedupStorage<'b>,
+        &'c mut PartitionedBuildState<'d>,
+    ),
     Plain(&'a mut PlainStorage<'b>, &'c mut PartitionedBuildState<'d>),
 }
 
@@ -227,7 +243,7 @@ impl<'a> BuildState<'a> {
         let tape = unsafe { Tape::new(index_relation, page_type) };
 
         BuildState {
-            memcxt: PgMemoryContexts::new("diskann build context"),
+            memcxt: PgMemoryContexts::new("geo_vec build context"),
             ntuples: 0,
             tape,
             graph,
@@ -247,7 +263,7 @@ impl<'a> BuildStateParallel<'a> {
         let tape = unsafe { Tape::new(index_relation, page_type) };
 
         BuildStateParallel {
-            memcxt: PgMemoryContexts::new("diskann build context"),
+            memcxt: PgMemoryContexts::new("geo_vec build context"),
             tape,
             graph,
             shared_state,
@@ -335,10 +351,10 @@ impl<'a> BuildStateParallel<'a> {
 }
 
 /// Maximum number of dimensions supported by pgvector's vector type.  Also
-/// the maximum number of dimensions that can be indexed with diskann.
+/// the maximum number of dimensions that can be indexed with geo_vec.
 pub const MAX_DIMENSION: u32 = 16000;
 
-/// Maximum number of dimensions that can be indexed with diskann without
+/// Maximum number of dimensions that can be indexed with geo_vec without
 /// using the SBQ storage type.
 pub const MAX_DIMENSION_NO_SBQ: u32 = 2000;
 
@@ -463,17 +479,19 @@ pub extern "C-unwind" fn ambuild(
     let write_stats =
         maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
 
-    // Check if this is a geo-vec index (has geometry column)
-    let has_geometry_column = index_relation.tuple_desc().len() > 1;
+    // Check if this is a geo-vec index (has a second column that is not labels)
+    let has_geometry_column = index_relation.tuple_desc().len() > 1 && !meta_page.has_labels();
 
     // PASS 1: Collect global bounding box for spatial partitioning
     let partitioner = if has_geometry_column {
+        ensure_postgis_bbox_api();
         unsafe {
             pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_COLLECTING_BBOX);
         }
         notice!("Collecting global bounding box for spatial partitioning...");
 
-        let global_bbox = unsafe { collect_global_bbox(index_info, &heap_relation, &index_relation) };
+        let global_bbox =
+            unsafe { collect_global_bbox(index_info, &heap_relation, &index_relation) };
 
         if !global_bbox.is_empty() {
             // Create grid partitioner from global bbox
@@ -513,6 +531,7 @@ pub extern "C-unwind" fn ambuild(
     let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
     let workers = if cfg!(feature = "build_parallel")
         && !meta_page.has_labels()
+        && !has_geometry_column
         && meta_page.get_storage_type() == StorageType::SbqCompression
     {
         // Check if we have a forced worker count setting
@@ -681,6 +700,9 @@ unsafe fn aminsert_internal(
     // in meta_page, tape, and index pages.  TODO: allow more concurrency.
     acquire_index_lock(&index_relation);
     let mut meta_page = MetaPage::fetch(&index_relation);
+    if index_relation.tuple_desc().len() > 1 && !meta_page.has_labels() {
+        ensure_postgis_bbox_api();
+    }
 
     let vec = LabeledVector::from_datums(values, isnull, &meta_page);
     if vec.is_none() {
@@ -748,7 +770,7 @@ unsafe fn insert_storage<S: Storage>(
     storage: &S,
     index_relation: &PgRelation,
     vector: LabeledVector,
-    bbox: Option<BBox2D>,  // Extracted from PostGIS geometry
+    bbox: Option<BBox2D>, // Extracted from PostGIS geometry
     heap_pointer: ItemPointer,
     meta_page: &mut MetaPage,
     stats: &mut InsertStats,
@@ -768,8 +790,76 @@ unsafe fn insert_storage<S: Storage>(
         stats,
     );
 
+    // Keep insert behavior aligned with partitioned build:
+    // assign partition and use partition-aware graph entry points when enabled.
+    let partition_context = if meta_page.has_spatial_partitioning() {
+        let partition_id = meta_page
+            .get_grid_partitioner()
+            .map(|partitioner| partitioner.partition_for_bbox(&node_bbox));
+
+        if let Some(partition_id) = partition_id {
+            meta_page.init_partition_start_nodes();
+
+            let mut updated_meta = false;
+            if let Some(partition_start_nodes) = meta_page.get_partition_start_nodes_mut() {
+                if !partition_start_nodes.has_partition(partition_id) {
+                    partition_start_nodes.set_partition_start(partition_id, index_pointer);
+                    updated_meta = true;
+                }
+            }
+
+            if meta_page.get_partition_metadata().is_empty() {
+                if let Some(partitioner) = meta_page.get_grid_partitioner() {
+                    let mut partition_metadata =
+                        Vec::with_capacity(partitioner.num_cells() as usize);
+                    for pid in 0..partitioner.num_cells() {
+                        partition_metadata
+                            .push(PartitionMetadata::new(pid, partitioner.cell_bbox(pid)));
+                    }
+                    meta_page.set_partition_metadata(partition_metadata);
+                    updated_meta = true;
+                }
+            }
+
+            if let Some(metadata) = meta_page
+                .get_partition_metadata_mut()
+                .get_mut(partition_id as usize)
+            {
+                metadata.row_count = metadata.row_count.saturating_add(1);
+                if metadata.first_node.is_none() {
+                    metadata.first_node = Some((index_pointer.block_number, index_pointer.offset));
+                }
+                updated_meta = true;
+            }
+
+            if updated_meta {
+                unsafe {
+                    meta_page.store(index_relation, false);
+                }
+            }
+
+            Some((partition_id, meta_page.get_partition_start_nodes().cloned()))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
-    graph.insert(index_relation, index_pointer, vector, storage, stats);
+    if let Some((partition_id, Some(partition_start_nodes))) = partition_context {
+        graph.insert_partitioned(
+            index_relation,
+            index_pointer,
+            vector,
+            partition_id,
+            &partition_start_nodes,
+            storage,
+            stats,
+        );
+    } else {
+        graph.insert(index_relation, index_pointer, vector, storage, stats);
+    }
 }
 
 #[pg_guard]
@@ -1057,7 +1147,8 @@ fn do_heap_scan(
                     graph.get_meta_page(),
                 );
                 let page_type = PlainStorage::page_type();
-                let mut bs = PartitionedBuildState::new(index_relation, graph, page_type, grid_partitioner);
+                let mut bs =
+                    PartitionedBuildState::new(index_relation, graph, page_type, grid_partitioner);
                 let mut state = StorageBuildStatePartitioned::Plain(&mut plain, &mut bs);
 
                 unsafe {
@@ -1083,7 +1174,8 @@ fn do_heap_scan(
                 };
 
                 let page_type = SbqSpeedupStorage::page_type();
-                let mut bs = PartitionedBuildState::new(index_relation, graph, page_type, grid_partitioner);
+                let mut bs =
+                    PartitionedBuildState::new(index_relation, graph, page_type, grid_partitioner);
                 let mut state = StorageBuildStatePartitioned::SbqSpeedup(&mut bq, &mut bs);
 
                 unsafe {
@@ -1251,7 +1343,8 @@ fn finalize_partitioned_index_build<S: Storage>(
     index_relation: &PgRelation,
     mut write_stats: WriteStats,
 ) -> usize {
-    let (build_state, partition_start_nodes, partition_counts) = state.into_build_state();
+    let (build_state, partition_start_nodes, partition_counts, partitioner) =
+        state.into_build_state();
     let BuildState { graph, ntuples, .. } = build_state;
     let (neighbor_store, meta_page) = graph.into_parts();
     let cache_entries = neighbor_store.into_sorted();
@@ -1283,11 +1376,30 @@ fn finalize_partitioned_index_build<S: Storage>(
 
     // Store partition start nodes in meta page
     meta_page.set_partition_start_nodes(partition_start_nodes);
+    let mut partition_metadata = Vec::with_capacity(partition_counts.len());
+    for (partition_id, row_count) in partition_counts.iter().enumerate() {
+        let pid = partition_id as u32;
+        let mut metadata = PartitionMetadata::new(pid, partitioner.cell_bbox(pid));
+        metadata.row_count = *row_count;
+        if let Some(start_node) = meta_page
+            .get_partition_start_nodes()
+            .and_then(|starts| starts.get_partition_node(pid))
+        {
+            metadata.first_node = Some((start_node.block_number, start_node.offset));
+        }
+        partition_metadata.push(metadata);
+    }
+    meta_page.set_partition_metadata(partition_metadata);
 
     // Log partition distribution
     let non_empty_partitions = partition_counts.iter().filter(|&&c| c > 0).count();
     let max_partition_count = partition_counts.iter().max().copied().unwrap_or(0);
-    let min_non_empty = partition_counts.iter().filter(|&&c| c > 0).min().copied().unwrap_or(0);
+    let min_non_empty = partition_counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .min()
+        .copied()
+        .unwrap_or(0);
     pgrx::debug1!(
         "Partition distribution: {} non-empty partitions, min={}, max={}",
         non_empty_partitions,
@@ -1313,7 +1425,11 @@ fn finalize_partitioned_index_build<S: Storage>(
         );
     }
 
-    notice!("Indexed {} tuples with spatial partitioning ({} partitions)", ntuples, non_empty_partitions);
+    notice!(
+        "Indexed {} tuples with spatial partitioning ({} partitions)",
+        ntuples,
+        non_empty_partitions
+    );
 
     ntuples
 }
@@ -1369,7 +1485,14 @@ unsafe extern "C-unwind" fn build_callback(
         StorageBuildState::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, bbox, state, *plain);
+                build_callback_memory_wrapper(
+                    &index_relation,
+                    heap_pointer,
+                    vec,
+                    bbox,
+                    state,
+                    *plain,
+                );
             }
         }
     }
@@ -1386,7 +1509,9 @@ unsafe extern "C-unwind" fn build_callback_partitioned(
 ) {
     let heap_pointer = ItemPointer::with_item_pointer_data(*ctid);
     let index_relation = PgRelation::from_pg(index);
-    let state = (state as *mut StorageBuildStatePartitioned).as_mut().unwrap();
+    let state = (state as *mut StorageBuildStatePartitioned)
+        .as_mut()
+        .unwrap();
 
     // Extract bbox from PostGIS geometry column (column index 1)
     let bbox = unsafe {
@@ -1404,13 +1529,27 @@ unsafe extern "C-unwind" fn build_callback_partitioned(
         StorageBuildStatePartitioned::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_partitioned_memory_wrapper(&index_relation, heap_pointer, vec, bbox, state, *bq);
+                build_callback_partitioned_memory_wrapper(
+                    &index_relation,
+                    heap_pointer,
+                    vec,
+                    bbox,
+                    state,
+                    *bq,
+                );
             }
         }
         StorageBuildStatePartitioned::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_partitioned_memory_wrapper(&index_relation, heap_pointer, vec, bbox, state, *plain);
+                build_callback_partitioned_memory_wrapper(
+                    &index_relation,
+                    heap_pointer,
+                    vec,
+                    bbox,
+                    state,
+                    *plain,
+                );
             }
         }
     }
@@ -1601,7 +1740,15 @@ unsafe fn build_callback_parallel_memory_wrapper<S: Storage>(
 ) {
     let mut old_context = state.memcxt.set_as_current();
 
-    build_callback_parallel_internal(index, heap_pointer, vector, spare_vector, bbox, state, storage);
+    build_callback_parallel_internal(
+        index,
+        heap_pointer,
+        vector,
+        spare_vector,
+        bbox,
+        state,
+        storage,
+    );
 
     old_context.set_as_current();
     state.memcxt.reset();
@@ -1675,7 +1822,11 @@ pub mod tests {
     use std::collections::HashSet;
 
     use crate::access_method::distance::DistanceType;
+    use crate::access_method::meta_page::MetaPage;
+    use crate::partition::postgis::postgis_bbox_api_available;
+    use crate::partition::BBox2D;
     use pgrx::*;
+    use serial_test::serial;
 
     //TODO: add test where inserting and querying with vectors that are all the same.
 
@@ -1733,7 +1884,7 @@ pub mod tests {
                 GROUP BY
                     i % 300) g;
 
-            CREATE INDEX ON {table_name} USING diskann (embedding {operator_class}) WITH ({index_options});
+            CREATE INDEX ON {table_name} USING geo_vec (embedding {operator_class}) WITH ({index_options});
 
 
             SET enable_seqscan = 0;
@@ -1760,7 +1911,7 @@ pub mod tests {
                     "
             SET enable_seqscan = 0;
             SET enable_indexscan = 1;
-            SET diskann.query_search_list_size = 2;
+            SET geo_vec.query_search_list_size = 2;
             WITH cte as (select * from {table_name} order by embedding {operator} $1::vector) SELECT count(*) from cte;
             ",
                 ),
@@ -1817,7 +1968,7 @@ pub mod tests {
                 "
         SET enable_seqscan = 0;
         SET enable_indexscan = 1;
-        SET diskann.query_search_list_size = 25;
+        SET geo_vec.query_search_list_size = 25;
         WITH cte AS (
             SELECT
                 ctid::TEXT
@@ -1907,7 +2058,7 @@ pub mod tests {
                 "
         SET enable_seqscan = 0;
         SET enable_indexscan = 1;
-        SET diskann.query_search_list_size = 2;
+        SET geo_vec.query_search_list_size = 2;
         WITH cte as (select * from {table_name} order by embedding {operator} $1::vector) SELECT count(*) from cte;
         ",
             ),
@@ -1930,7 +2081,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding vector_l2_ops);
+               USING geo_vec(embedding vector_l2_ops);
 
             INSERT INTO test(embedding) VALUES ('[1,1,1]'), ('[2,2,2]');
             ",
@@ -1940,14 +2091,14 @@ pub mod tests {
         // least one of the queries if rescoring is disabled.
         let res_a: Option<Vec<String>> = Spi::get_one(
             "set enable_seqscan = 0;
-            SET diskann.query_rescore = 0;
+            SET geo_vec.query_rescore = 0;
             WITH cte as (select * from test order by embedding <-> '[1,1,1]' LIMIT 1)
             SELECT array_agg(embedding::text) from cte;",
         )?;
         let wrong_a = res_a.unwrap() != vec!["[1,1,1]"];
         let res_b: Option<Vec<String>> = Spi::get_one(
             "set enable_seqscan = 0;
-            SET diskann.query_rescore = 0;
+            SET geo_vec.query_rescore = 0;
             WITH cte as (select * from test order by embedding <-> '[2,2,2]' LIMIT 1)
             SELECT array_agg(embedding::text) from cte;",
         )?;
@@ -1958,13 +2109,13 @@ pub mod tests {
         // both queries.
         let res_a: Option<Vec<String>> = Spi::get_one(
             "set enable_seqscan = 0;
-            SET diskann.query_rescore = 2;
+            SET geo_vec.query_rescore = 2;
             WITH cte as (select * from test order by embedding <-> '[1,1,1]' LIMIT 1)
             SELECT array_agg(embedding::text) from cte;",
         )?;
         let res_b: Option<Vec<String>> = Spi::get_one(
             "set enable_seqscan = 0;
-            SET diskann.query_rescore = 2;
+            SET geo_vec.query_rescore = 2;
             WITH cte as (select * from test order by embedding <-> '[2,2,2]' LIMIT 1)
             SELECT array_agg(embedding::text) from cte;",
         )?;
@@ -1983,7 +2134,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding vector_l2_ops)
+               USING geo_vec(embedding vector_l2_ops)
                 WITH (num_neighbors=10, search_list_size=10);
 
             INSERT INTO test(embedding) VALUES ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]');
@@ -2026,7 +2177,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding vector_ip_ops)
+               USING geo_vec(embedding vector_ip_ops)
                 WITH (num_neighbors=10, search_list_size=10);
 
             INSERT INTO test(embedding) VALUES ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]');
@@ -2066,7 +2217,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding)
+               USING geo_vec(embedding)
                 WITH ({index_options});
 
             INSERT INTO test(embedding) VALUES ('[1,2,3]'), ('[4,5,6]'), ('[7,8,10]');
@@ -2096,7 +2247,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding)
+               USING geo_vec(embedding)
                 WITH ({index_options});
 
             INSERT INTO test(embedding) VALUES ('[1,2,3]'), ('[4,5,6]'), ('[7,8,10]');
@@ -2145,7 +2296,7 @@ pub mod tests {
                 GROUP BY
                     i % {expected_cnt}) g;
 
-            CREATE INDEX ON {table_name} USING diskann (embedding {operator_class}) WITH ({index_options});
+            CREATE INDEX ON {table_name} USING geo_vec (embedding {operator_class}) WITH ({index_options});
 
 
             SET enable_seqscan = 0;
@@ -2170,7 +2321,7 @@ pub mod tests {
                     "
             SET enable_seqscan = 0;
             SET enable_indexscan = 1;
-            SET diskann.query_search_list_size = 2;
+            SET geo_vec.query_search_list_size = 2;
             WITH cte as (select * from {table_name} order by embedding {operator} $1::vector) SELECT count(*) from cte;
             ",
                 ),
@@ -2206,7 +2357,7 @@ pub mod tests {
                 "
         SET enable_seqscan = 0;
         SET enable_indexscan = 1;
-        SET diskann.query_search_list_size = 2;
+        SET geo_vec.query_search_list_size = 2;
         WITH cte as (select * from {table_name} order by embedding {operator} $1::vector) SELECT count(*) from cte;
         ",
             ),
@@ -2232,7 +2383,7 @@ pub mod tests {
                     &format!("
             SET enable_seqscan = 0;
             SET enable_indexscan = 1;
-            SET diskann.query_search_list_size = 2;
+            SET geo_vec.query_search_list_size = 2;
             WITH cte as (select * from {table_name} order by embedding <=> $1::vector) SELECT count(*) from cte;
             "),
                 &[unsafe { pgrx::datum::DatumWithOid::new(test_vec.clone().into_datum(), pgrx::pg_sys::FLOAT4ARRAYOID) }],
@@ -2244,7 +2395,7 @@ pub mod tests {
                     &format!("
             SET enable_seqscan = 0;
             SET enable_indexscan = 1;
-            SET diskann.query_search_list_size = 2;
+            SET geo_vec.query_search_list_size = 2;
             WITH cte as (select id from {table_name} EXCEPT (select id from {table_name} order by embedding <=> $1::vector)) SELECT ctid::text || ' ' || id from {table_name} where id in (select id from cte limit 1);
             "),
                 &[unsafe { pgrx::datum::DatumWithOid::new(test_vec.clone().into_datum(), pgrx::pg_sys::FLOAT4ARRAYOID) }],
@@ -2285,7 +2436,7 @@ pub mod tests {
                 GROUP BY
                     i % {expected_cnt}) g;
 
-            CREATE INDEX idx_diskann_bq ON test_data USING diskann (embedding) WITH ({index_options});
+            CREATE INDEX idx_geo_vec_bq ON test_data USING geo_vec (embedding) WITH ({index_options});
 
 
             SET enable_seqscan = 0;
@@ -2322,7 +2473,7 @@ pub mod tests {
                 embedding vector ({dimensions})
             );
 
-            CREATE INDEX idx_diskann_insert_after ON test_data_insert_after USING diskann (embedding) WITH ({index_options});
+            CREATE INDEX idx_geo_vec_insert_after ON test_data_insert_after USING geo_vec (embedding) WITH ({index_options});
 
             select setseed(0.5);
            -- generate {expected_cnt} vectors
@@ -2401,7 +2552,7 @@ pub mod tests {
             SET enable_seqscan = 0;
 
             SET maintenance_work_mem = {maintenance_work_mem_kb};
-            CREATE INDEX ON test_data USING diskann (embedding) WITH ({index_options});
+            CREATE INDEX ON test_data USING geo_vec (embedding) WITH ({index_options});
 
             -- perform index scans on the vectors
             SELECT
@@ -2436,7 +2587,7 @@ pub mod tests {
                 labels smallint[]
             );
 
-            CREATE INDEX idx_diskann_labeled ON test_data_labeled USING diskann (embedding, labels) WITH ({index_options});
+            CREATE INDEX idx_geo_vec_labeled ON test_data_labeled USING geo_vec (embedding, labels) WITH ({index_options});
 
             select setseed(0.5);
 
@@ -2526,7 +2677,7 @@ pub mod tests {
 
             CREATE INDEX idxtest
                   ON test
-               USING diskann(embedding vector_l2_ops)
+               USING geo_vec(embedding vector_l2_ops)
                 WITH (num_neighbors=10, search_list_size=10);
 
             INSERT INTO test(embedding) VALUES ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]');
@@ -2544,6 +2695,196 @@ pub mod tests {
         assert_eq!(count, Some(3));
         // Clean up
         Spi::run("DROP TABLE test CASCADE;")?;
+        Ok(())
+    }
+
+    fn setup_geo_test_table(table_name: &str, index_name: &str) -> spi::Result<()> {
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis;")?;
+        Spi::run(
+            "DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_opclass c
+                    JOIN pg_am a ON a.oid = c.opcmethod
+                    WHERE c.opcname = 'geometry_geo_vec_ops'
+                    AND a.amname = 'geo_vec'
+                ) THEN
+                    CREATE OPERATOR CLASS geometry_geo_vec_ops
+                    FOR TYPE geometry USING geo_vec AS
+                    OPERATOR 1 && (geometry, geometry);
+                END IF;
+            END;
+            $$;",
+        )?;
+
+        Spi::run(&format!(
+            "DROP TABLE IF EXISTS {table_name} CASCADE;
+             CREATE TABLE {table_name} (
+                id SERIAL PRIMARY KEY,
+                embedding vector(3),
+                geom geometry(Point, 4326)
+             );",
+        ))?;
+
+        Spi::run(&format!(
+            "INSERT INTO {table_name}(embedding, geom)
+             SELECT
+                ARRAY[random()::float8, random()::float8, random()::float8]::vector(3),
+                ST_SetSRID(ST_MakePoint(random() * 10.0, random() * 10.0), 4326)
+             FROM generate_series(1, 40);",
+        ))?;
+
+        Spi::run(&format!(
+            "CREATE INDEX {index_name}
+             ON {table_name}
+             USING geo_vec (embedding vector_l2_ops, geom geometry_geo_vec_ops);",
+        ))?;
+
+        Ok(())
+    }
+
+    fn fetch_meta(index_name: &str) -> spi::Result<MetaPage> {
+        let index_oid =
+            Spi::get_one::<pg_sys::Oid>(&format!("SELECT '{index_name}'::regclass::oid"))?
+                .expect("index oid should exist");
+        let index_relation =
+            unsafe { PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid)) };
+        Ok(MetaPage::fetch(&index_relation))
+    }
+
+    #[pg_test]
+    #[serial]
+    pub unsafe fn test_geo_partition_metadata_updates_on_insert() -> spi::Result<()> {
+        if !postgis_bbox_api_available() {
+            pgrx::warning!(
+                "Skipping geo partition metadata test because PostGIS bbox API is unavailable"
+            );
+            return Ok(());
+        }
+
+        let table = "geo_meta_update_test";
+        let index = "geo_meta_update_test_idx";
+        setup_geo_test_table(table, index)?;
+
+        let meta_before = fetch_meta(index)?;
+        assert!(meta_before.has_spatial_partitioning());
+        assert!(!meta_before.get_partition_metadata().is_empty());
+        let before_count: u64 = meta_before
+            .get_partition_metadata()
+            .iter()
+            .map(|m| m.row_count)
+            .sum();
+        assert_eq!(before_count, 40);
+
+        Spi::run(&format!(
+            "INSERT INTO {table}(embedding, geom) VALUES
+                ('[0.01,0.02,0.03]'::vector(3), ST_SetSRID(ST_MakePoint(1.1, 1.2), 4326)),
+                ('[0.11,0.12,0.13]'::vector(3), ST_SetSRID(ST_MakePoint(2.1, 2.2), 4326)),
+                ('[0.21,0.22,0.23]'::vector(3), ST_SetSRID(ST_MakePoint(3.1, 3.2), 4326));",
+        ))?;
+
+        let meta_after = fetch_meta(index)?;
+        let after_count: u64 = meta_after
+            .get_partition_metadata()
+            .iter()
+            .map(|m| m.row_count)
+            .sum();
+        assert_eq!(after_count, 43);
+        assert!(meta_after
+            .get_partition_metadata()
+            .iter()
+            .any(|m| m.first_node.is_some()));
+
+        Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
+        Ok(())
+    }
+
+    #[pg_test]
+    #[serial]
+    pub unsafe fn test_geo_empty_overlap_partitions_and_query() -> spi::Result<()> {
+        if !postgis_bbox_api_available() {
+            pgrx::warning!(
+                "Skipping empty-overlap partition test because PostGIS bbox API is unavailable"
+            );
+            return Ok(());
+        }
+
+        let table = "geo_empty_overlap_test";
+        let index = "geo_empty_overlap_test_idx";
+        setup_geo_test_table(table, index)?;
+
+        let meta = fetch_meta(index)?;
+        let partitioner = meta
+            .get_grid_partitioner()
+            .expect("partitioner should be available for geo index");
+        let far_bbox = BBox2D::new(1000.0, 1001.0, 1000.0, 1001.0);
+        assert!(partitioner.overlapping_cells(&far_bbox).is_empty());
+
+        let far_count = Spi::get_one::<i64>(&format!(
+            "SET enable_seqscan = 0;
+             WITH cte AS (
+                SELECT id
+                FROM {table}
+                WHERE geom && ST_MakeEnvelope(1000, 1000, 1001, 1001, 4326)
+                ORDER BY embedding <=> '[0,0,0]'::vector(3)
+                LIMIT 10
+             )
+             SELECT count(*) FROM cte;"
+        ))?
+        .expect("count should not be null");
+        assert_eq!(far_count, 0);
+
+        Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
+        Ok(())
+    }
+
+    #[pg_test]
+    #[serial]
+    pub unsafe fn test_fail_fast_when_postgis_api_unavailable() -> spi::Result<()> {
+        let table = "geo_fail_fast_test";
+        let index = "geo_fail_fast_test_idx";
+        let _ = Spi::run(&format!("DROP TABLE IF EXISTS {table} CASCADE;"));
+
+        Spi::run(&format!(
+            "CREATE TABLE {table} (
+                embedding vector(3),
+                aux vector(3)
+            );"
+        ))?;
+
+        if postgis_bbox_api_available() {
+            Spi::run(&format!(
+                "CREATE INDEX {index}
+                 ON {table}
+                 USING geo_vec (embedding vector_l2_ops, aux vector_l2_ops);"
+            ))?;
+            Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
+            return Ok(());
+        }
+
+        let got_error = Spi::get_one::<bool>(&format!(
+            "DO $$
+             BEGIN
+                 BEGIN
+                     EXECUTE 'CREATE INDEX {index} ON {table} USING geo_vec (embedding vector_l2_ops, aux vector_l2_ops)';
+                     RAISE EXCEPTION 'expected PostGIS API error but index creation succeeded';
+                 EXCEPTION
+                     WHEN OTHERS THEN
+                         IF position('PostGIS bbox helper API is unavailable' in SQLERRM) > 0 THEN
+                             NULL;
+                         ELSE
+                             RAISE;
+                         END IF;
+                 END;
+             END
+             $$;
+             SELECT true;"
+        ))?
+        .unwrap_or(false);
+        assert!(got_error);
+
+        Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
         Ok(())
     }
 }

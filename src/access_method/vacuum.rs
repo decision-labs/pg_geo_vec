@@ -207,7 +207,7 @@ pub mod tests {
 
         CREATE INDEX idxtest_vac
               ON test_vac
-           USING diskann(embedding)
+           USING geo_vec(embedding)
             WITH ({index_options});
             "
             ))
@@ -320,7 +320,7 @@ pub mod tests {
 
         CREATE INDEX idxtest_vac_full
               ON test_vac_full
-           USING diskann(embedding)
+           USING geo_vec(embedding)
             WITH ({index_options});
             "
             ))
@@ -438,7 +438,7 @@ pub mod tests {
 
         client
             .execute(
-                &format!("CREATE INDEX idx_diskann_bq ON test_data_hot_test_1 USING diskann (embedding) WITH({index_options});"),
+                &format!("CREATE INDEX idx_geo_vec_bq ON test_data_hot_test_1 USING geo_vec (embedding) WITH({index_options});"),
                 &[],
             )
             .unwrap();

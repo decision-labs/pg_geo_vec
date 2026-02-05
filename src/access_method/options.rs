@@ -279,7 +279,7 @@ mod tests {
             "CREATE TABLE test(encoding vector(3));
         CREATE INDEX idxtest
                   ON test
-               USING diskann(encoding)
+               USING geo_vec(encoding)
                 WITH (num_neighbors=30);",
         )?;
 
@@ -302,7 +302,7 @@ mod tests {
             "CREATE TABLE test(encoding vector(3));
         CREATE INDEX idxtest
                   ON test
-               USING diskann(encoding);",
+               USING geo_vec(encoding);",
         )?;
 
         let index_oid =
@@ -327,7 +327,7 @@ mod tests {
             "CREATE TABLE test(encoding vector(3));
         CREATE INDEX idxtest
                   ON test
-               USING diskann(encoding)
+               USING geo_vec(encoding)
                WITH (storage_layout = plain);",
         )?;
 
@@ -347,7 +347,7 @@ mod tests {
         Spi::run("CREATE TABLE test(encoding vector(3));
         CREATE INDEX idxtest
                   ON test
-               USING diskann(encoding)
+               USING geo_vec(encoding)
                WITH (storage_layout = plain, num_neighbors=40, search_list_size=18, num_dimensions=20, max_alpha=1.4);")?;
 
         let index_oid =
@@ -371,7 +371,7 @@ mod tests {
         Spi::run("CREATE TABLE test(encoding vector(3));
         CREATE INDEX idxtest
                   ON test
-               USING diskann(encoding)
+               USING geo_vec(encoding)
                WITH (storage_layout = memory_optimized, num_neighbors=40, search_list_size=18, num_dimensions=20, max_alpha=1.4, num_bits_per_dimension=5);")?;
 
         let index_oid =

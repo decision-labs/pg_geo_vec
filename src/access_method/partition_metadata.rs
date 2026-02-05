@@ -6,7 +6,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 /// Partition metadata stored in the index
 /// Each partition has its own bounding box and graph
-#[derive(Clone, Debug, Archive, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Archive, Deserialize, Serialize)]
 #[archive(check_bytes)]
 pub struct PartitionMetadata {
     /// Partition ID (0-based)

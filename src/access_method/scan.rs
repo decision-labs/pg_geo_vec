@@ -5,9 +5,9 @@ use pgrx::{pg_sys::InvalidOffsetNumber, *};
 use crate::{
     access_method::{
         graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
-        partition_metadata::GlobalBBox, sbq::storage::SbqSpeedupStorage,
+        sbq::storage::SbqSpeedupStorage,
     },
-    partition::postgis::postgis_extract_bbox,
+    partition::postgis::{ensure_postgis_bbox_api, postgis_extract_bbox},
     util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
 };
 
@@ -47,8 +47,6 @@ struct TSVScanState {
     last_buffer: Option<PinnedBufferShare>,
     /// Query bbox for spatial filtering (from PostGIS && operator)
     query_bbox: Option<BBox2D>,
-    /// Global bbox from meta page
-    global_bbox: GlobalBBox,
 }
 
 impl TSVScanState {
@@ -59,7 +57,6 @@ impl TSVScanState {
             meta_page: meta_page.clone(),
             last_buffer: None,
             query_bbox: None,
-            global_bbox: meta_page.get_global_bbox().clone(),
         }
     }
 
@@ -128,10 +125,6 @@ impl TSVScanState {
 
         // Find overlapping partitions
         let partition_ids = partitioner.overlapping_cells(query_bbox);
-
-        if partition_ids.is_empty() {
-            return None;
-        }
 
         pgrx::debug1!(
             "Query overlaps {} partitions: {:?}",
@@ -427,9 +420,11 @@ pub extern "C-unwind" fn amrescan(
     let search_list_size = super::guc::TSV_QUERY_SEARCH_LIST_SIZE.get() as usize;
 
     let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
+    state.query_bbox = None;
 
     // Extract query bbox from spatial filter key if present
-    if nkeys > 0 && !keys[0].sk_argument.is_null() {
+    if nkeys > 0 && !state.meta_page.has_labels() && !keys[0].sk_argument.is_null() {
+        ensure_postgis_bbox_api();
         // The key contains a geometry from the spatial filter (e.g., && operator)
         let geom_datum = keys[0].sk_argument;
         // SAFETY: postgis_extract_bbox handles NULL geoms and validates the geometry type
@@ -437,7 +432,10 @@ pub extern "C-unwind" fn amrescan(
             state.query_bbox = Some(bbox);
             pgrx::debug1!(
                 "Spatial filter bbox: ({}, {}) - ({}, {})",
-                bbox.xmin, bbox.ymin, bbox.xmax, bbox.ymax
+                bbox.xmin,
+                bbox.ymin,
+                bbox.xmax,
+                bbox.ymax
             );
         }
     }

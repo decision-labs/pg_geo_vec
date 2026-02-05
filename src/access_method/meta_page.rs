@@ -1,6 +1,6 @@
+use pg_geo_vec_derive::{Readable, Writeable};
 use pgrx::pg_sys::{BufferGetBlockNumber, InvalidBlockNumber, InvalidOffsetNumber};
 use pgrx::*;
-use pg_geo_vec_derive::{Readable, Writeable};
 use rkyv::{Archive, Deserialize, Serialize};
 use semver::Version;
 
@@ -9,15 +9,15 @@ use super::options::{
     NUM_DIMENSIONS_DEFAULT_SENTINEL, NUM_NEIGHBORS_DEFAULT_SENTINEL,
     SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL,
 };
-use super::partition_metadata::GlobalBBox;
+use super::partition_metadata::{GlobalBBox, PartitionMetadata};
 use super::storage::StorageType;
 use super::storage_common::get_num_index_attributes;
 use crate::access_method::graph::start_nodes::{PartitionStartNodes, StartNodes};
-use crate::partition::GridPartitioner;
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::stats::WriteStats;
 use crate::partition::BBox2D;
+use crate::partition::GridPartitioner;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType};
 use crate::util::*;
@@ -91,7 +91,7 @@ impl From<&MetaPageV1> for MetaPage {
             has_labels: false,
             global_bbox: GlobalBBox::empty(),
             num_partitions: 0,
-            partitions_offset: InvalidOffsetNumber,
+            partition_metadata: Vec::new(),
             partition_start_nodes: None,
             grid_cols: 0,
             grid_rows: 0,
@@ -168,7 +168,7 @@ impl From<MetaPageV2> for MetaPage {
             has_labels: false,
             global_bbox: GlobalBBox::empty(),
             num_partitions: 0,
-            partitions_offset: InvalidOffsetNumber,
+            partition_metadata: Vec::new(),
             partition_start_nodes: None,
             grid_cols: 0,
             grid_rows: 0,
@@ -225,8 +225,8 @@ pub struct MetaPage {
     global_bbox: GlobalBBox,
     /// Number of spatial partitions
     num_partitions: u32,
-    /// Partition configuration and metadata (stored as variable-length data)
-    partitions_offset: pg_sys::OffsetNumber,
+    /// Partition configuration and metadata
+    partition_metadata: Vec<PartitionMetadata>,
     /// Partition start nodes - per-partition entry points for spatial search
     partition_start_nodes: Option<PartitionStartNodes>,
     /// Grid columns for spatial partitioning
@@ -407,7 +407,7 @@ impl MetaPage {
             has_labels,
             global_bbox: GlobalBBox::empty(),
             num_partitions: 0,
-            partitions_offset: InvalidOffsetNumber,
+            partition_metadata: Vec::new(),
             partition_start_nodes: None,
             grid_cols: 0,
             grid_rows: 0,
@@ -512,6 +512,9 @@ impl MetaPage {
         self.grid_cols = cols;
         self.grid_rows = rows;
         self.num_partitions = num_partitions;
+        if self.partition_metadata.len() != num_partitions as usize {
+            self.partition_metadata.clear();
+        }
     }
 
     /// Get the grid columns
@@ -527,6 +530,19 @@ impl MetaPage {
     /// Get the number of partitions
     pub fn get_num_partitions(&self) -> u32 {
         self.num_partitions
+    }
+
+    pub fn get_partition_metadata(&self) -> &[PartitionMetadata] {
+        &self.partition_metadata
+    }
+
+    pub fn get_partition_metadata_mut(&mut self) -> &mut Vec<PartitionMetadata> {
+        &mut self.partition_metadata
+    }
+
+    pub fn set_partition_metadata(&mut self, partition_metadata: Vec<PartitionMetadata>) {
+        self.num_partitions = partition_metadata.len() as u32;
+        self.partition_metadata = partition_metadata;
     }
 
     /// Create a GridPartitioner from the stored configuration and global bbox
