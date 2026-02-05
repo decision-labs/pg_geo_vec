@@ -262,6 +262,20 @@ BEGIN
         DEFAULT FOR TYPE smallint[] USING geo_vec AS
             OPERATOR 1 &&;
     END IF;
+
+    -- Geometry operator class for spatial filtering (requires PostGIS)
+    IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'geometry') THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_opclass c
+            WHERE c.opcname = 'geometry_ops'
+            AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'geo_vec')
+        ) THEN
+            CREATE OPERATOR CLASS geometry_ops
+            FOR TYPE geometry USING geo_vec
+            FAMILY vector_cosine_ops AS
+                OPERATOR 1 && (geometry, geometry) FOR SEARCH;
+        END IF;
+    END IF;
 END;
 $$;
 "#,

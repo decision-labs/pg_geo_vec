@@ -445,7 +445,9 @@ pub extern "C-unwind" fn amrescan(
         }
     }
 
-    let query = unsafe { LabeledVector::from_scan_key_data(keys, orderby_keys, &state.meta_page) };
+    // Only pass keys to from_scan_key_data when they are label keys (not geometry keys)
+    let label_keys = if state.meta_page.has_labels() { keys } else { &[] };
+    let query = unsafe { LabeledVector::from_scan_key_data(label_keys, orderby_keys, &state.meta_page) };
 
     state.initialize(&indexrel, &heaprel, query, search_list_size);
 }

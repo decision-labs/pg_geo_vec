@@ -31,58 +31,6 @@ impl PartitionMetadata {
             first_node: None,
         }
     }
-
-    pub fn is_valid(&self) -> bool {
-        self.root_page != 0 || self.first_node.is_some()
-    }
-}
-
-/// Partitioning method
-#[derive(Clone, Copy, Debug)]
-pub enum PartitionMethod {
-    /// Uniform grid - divide space into equal-sized cells
-    Grid,
-    /// Quadtree-like recursive subdivision
-    Quadtree,
-    /// Use existing GiST index for partitioning
-    GiST,
-    /// Automatic selection based on data distribution
-    Auto,
-}
-
-impl PartitionMethod {
-    pub fn from_string(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "grid" => PartitionMethod::Grid,
-            "quadtree" => PartitionMethod::Quadtree,
-            "gist" => PartitionMethod::GiST,
-            "auto" | _ => PartitionMethod::Auto,
-        }
-    }
-}
-
-/// Configuration for spatial partitioning
-#[derive(Clone, Debug)]
-pub struct PartitionConfig {
-    /// Number of partitions (for grid method)
-    pub num_partitions: u32,
-    /// Partitioning method
-    pub method: PartitionMethod,
-    /// Maximum number of points per partition (for quadtree)
-    pub max_points_per_partition: usize,
-    /// Minimum partition size (for quadtree)
-    pub min_partition_size: usize,
-}
-
-impl Default for PartitionConfig {
-    fn default() -> Self {
-        Self {
-            num_partitions: 64,
-            method: PartitionMethod::Auto,
-            max_points_per_partition: 10000,
-            min_partition_size: 1000,
-        }
-    }
 }
 
 /// Global bounding box - union of all partition bboxes

@@ -95,7 +95,6 @@ pub struct Partition {
     pub id: u32,
     pub bbox: BBox2D,
     pub row_count: u64,
-    pub root_page: u32,
 }
 
 impl Partition {
@@ -104,7 +103,6 @@ impl Partition {
             id,
             bbox,
             row_count: 0,
-            root_page: 0,
         }
     }
 }
