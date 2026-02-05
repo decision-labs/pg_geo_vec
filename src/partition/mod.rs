@@ -182,14 +182,11 @@ impl GridPartitioner {
 
     /// Create a GridPartitioner from stored configuration (used when loading from MetaPage)
     pub fn from_config(bbox: BBox2D, grid_cols: u32, grid_rows: u32) -> Self {
-        // Expand bounds slightly to ensure all points are covered (same as new())
-        let expanded = bbox.expand_bounds(0.01);
-
         Self {
-            xmin: expanded.xmin,
-            ymin: expanded.ymin,
-            xmax: expanded.xmax,
-            ymax: expanded.ymax,
+            xmin: bbox.xmin,
+            ymin: bbox.ymin,
+            xmax: bbox.xmax,
+            ymax: bbox.ymax,
             grid_cols,
             grid_rows,
         }

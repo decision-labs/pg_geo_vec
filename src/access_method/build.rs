@@ -34,6 +34,7 @@ use super::sbq::storage::SbqSpeedupStorage;
 use super::graph::start_nodes::PartitionStartNodes;
 use super::meta_page::MetaPage;
 use super::partition_metadata::{GlobalBBox, PartitionMetadata};
+use super::type_utils::is_geometry_column;
 use crate::partition::GridPartitioner;
 
 use super::plain::storage::PlainStorage;
@@ -91,21 +92,24 @@ unsafe fn collect_global_bbox(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback_bbox_collect(
-    _index: pg_sys::Relation,
+    index: pg_sys::Relation,
     _ctid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
     _tuple_is_alive: bool,
     state: *mut std::os::raw::c_void,
 ) {
+    let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut BBoxScanState).as_mut().unwrap();
 
-    // Extract bbox from PostGIS geometry column (column index 1)
-    let isnull_ptr = isnull.offset(1);
-    if !isnull_ptr.read() {
-        let geom_datum = values.offset(1).read();
-        if let Some(bbox) = postgis_extract_bbox(geom_datum) {
-            state.global_bbox.expand(&bbox);
+    if is_geometry_column(&index_relation, 1) {
+        // Extract bbox from PostGIS geometry column (column index 1)
+        let isnull_ptr = isnull.offset(1);
+        if !isnull_ptr.read() {
+            let geom_datum = values.offset(1).read();
+            if let Some(bbox) = postgis_extract_bbox(geom_datum) {
+                state.global_bbox.expand(&bbox);
+            }
         }
     }
 
@@ -480,7 +484,9 @@ pub extern "C-unwind" fn ambuild(
         maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
 
     // Check if this is a geo-vec index (has a second column that is not labels)
-    let has_geometry_column = index_relation.tuple_desc().len() > 1 && !meta_page.has_labels();
+    let has_geometry_column = index_relation.tuple_desc().len() > 1
+        && !meta_page.has_labels()
+        && is_geometry_column(&index_relation, 1);
 
     // PASS 1: Collect global bounding box for spatial partitioning
     let partitioner = if has_geometry_column {
@@ -700,7 +706,10 @@ unsafe fn aminsert_internal(
     // in meta_page, tape, and index pages.  TODO: allow more concurrency.
     acquire_index_lock(&index_relation);
     let mut meta_page = MetaPage::fetch(&index_relation);
-    if index_relation.tuple_desc().len() > 1 && !meta_page.has_labels() {
+    let has_geometry_column = index_relation.tuple_desc().len() > 1
+        && !meta_page.has_labels()
+        && is_geometry_column(&index_relation, 1);
+    if has_geometry_column {
         ensure_postgis_bbox_api();
     }
 
@@ -713,7 +722,7 @@ unsafe fn aminsert_internal(
 
     // Extract geometry datum from index column 1 (second column in geo_vec index)
     // The index columns are: 0=vector, 1=geometry
-    let geometry_datum = unsafe {
+    let geometry_datum = if has_geometry_column {
         let isnull_ptr = isnull.offset(1);
         if !isnull_ptr.read() {
             // Geometry column is not null - extract it
@@ -725,6 +734,8 @@ unsafe fn aminsert_internal(
             // Geometry is null - use empty bbox (no spatial filtering)
             None
         }
+    } else {
+        None
     };
 
     let heap_pointer = ItemPointer::with_item_pointer_data(*heap_tid);
@@ -1463,8 +1474,8 @@ unsafe extern "C-unwind" fn build_callback(
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut StorageBuildState).as_mut().unwrap();
 
-    // Extract bbox from PostGIS geometry column (column index 1)
-    let bbox = unsafe {
+    // Extract bbox only for geometry indexes (column index 1)
+    let bbox = if is_geometry_column(&index_relation, 1) {
         let isnull_ptr = isnull.offset(1);
         if !isnull_ptr.read() {
             let geom_datum = values.offset(1).read();
@@ -1473,6 +1484,8 @@ unsafe extern "C-unwind" fn build_callback(
         } else {
             None
         }
+    } else {
+        None
     };
 
     match state {
@@ -1513,8 +1526,8 @@ unsafe extern "C-unwind" fn build_callback_partitioned(
         .as_mut()
         .unwrap();
 
-    // Extract bbox from PostGIS geometry column (column index 1)
-    let bbox = unsafe {
+    // Extract bbox only for geometry indexes (column index 1)
+    let bbox = if is_geometry_column(&index_relation, 1) {
         let isnull_ptr = isnull.offset(1);
         if !isnull_ptr.read() {
             let geom_datum = values.offset(1).read();
@@ -1523,6 +1536,8 @@ unsafe extern "C-unwind" fn build_callback_partitioned(
         } else {
             None
         }
+    } else {
+        None
     };
 
     match state {
@@ -1568,8 +1583,8 @@ unsafe extern "C-unwind" fn build_callback_parallel(
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut StorageBuildStateParallel).as_mut().unwrap();
 
-    // Extract bbox from PostGIS geometry column (column index 1)
-    let bbox = unsafe {
+    // Parallel build currently excludes geometry indexes; keep this guarded for safety.
+    let bbox = if is_geometry_column(&index_relation, 1) {
         let isnull_ptr = isnull.offset(1);
         if !isnull_ptr.read() {
             let geom_datum = values.offset(1).read();
@@ -1578,6 +1593,8 @@ unsafe extern "C-unwind" fn build_callback_parallel(
         } else {
             None
         }
+    } else {
+        None
     };
 
     match state {

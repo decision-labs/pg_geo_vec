@@ -19,6 +19,7 @@ mod scan;
 pub mod stats;
 mod storage;
 mod storage_common;
+mod type_utils;
 mod vacuum;
 
 /// Access method support function numbers

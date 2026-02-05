@@ -375,13 +375,11 @@ impl MetaPage {
             );
         }
 
-        // Check if second column is labels (smallint array) or geometry
-        // If there's a geometry column, it's for spatial partitioning, not labels
+        // Check if second column is labels (smallint array).
+        // Geometry detection is handled separately where spatial paths are enabled.
         let has_labels = if get_num_index_attributes(index) == 2 {
-            // Check the type of the second column - if it's geometry, it's not labels
             if let Some(attr) = index.tuple_desc().get(1) {
                 // Smallint array type OID is 1005 (INT2ARRAYOID)
-                // If it's smallint array, it's labels. Otherwise assume geometry.
                 attr.type_oid().value() == pgrx::pg_sys::Oid::from(1005)
             } else {
                 false

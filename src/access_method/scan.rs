@@ -25,6 +25,7 @@ use super::{
     },
     stats::QuantizerStats,
     storage::{Storage, StorageType},
+    type_utils::is_geometry_column,
 };
 
 use crate::partition::BBox2D;
@@ -423,7 +424,11 @@ pub extern "C-unwind" fn amrescan(
     state.query_bbox = None;
 
     // Extract query bbox from spatial filter key if present
-    if nkeys > 0 && !state.meta_page.has_labels() && !keys[0].sk_argument.is_null() {
+    if nkeys > 0
+        && !state.meta_page.has_labels()
+        && is_geometry_column(&indexrel, 1)
+        && !keys[0].sk_argument.is_null()
+    {
         ensure_postgis_bbox_api();
         // The key contains a geometry from the spatial filter (e.g., && operator)
         let geom_datum = keys[0].sk_argument;

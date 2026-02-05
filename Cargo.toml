@@ -8,7 +8,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "pgrx_embed_geo_vec"
+name = "pgrx_embed_pg_geo_vec"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
