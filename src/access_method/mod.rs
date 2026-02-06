@@ -11,7 +11,6 @@ mod labels;
 mod meta_page;
 mod node;
 pub mod options;
-pub mod partition_metadata;
 pub mod pg_vector;
 pub mod plain;
 mod sbq;
@@ -19,7 +18,6 @@ mod scan;
 pub mod stats;
 mod storage;
 mod storage_common;
-mod type_utils;
 mod vacuum;
 
 /// Access method support function numbers
@@ -261,20 +259,6 @@ BEGIN
         CREATE OPERATOR CLASS vector_smallint_label_ops
         DEFAULT FOR TYPE smallint[] USING geo_vec AS
             OPERATOR 1 &&;
-    END IF;
-
-    -- Geometry operator class for spatial filtering (requires PostGIS)
-    IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'geometry') THEN
-        IF NOT EXISTS (
-            SELECT 1 FROM pg_catalog.pg_opclass c
-            WHERE c.opcname = 'geometry_geo_vec_ops'
-            AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'geo_vec')
-            AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace where nspname='@extschema@')
-        ) THEN
-            CREATE OPERATOR CLASS geometry_geo_vec_ops
-            FOR TYPE geometry USING geo_vec AS
-                OPERATOR 1 && (geometry, geometry) FOR SEARCH;
-        END IF;
     END IF;
 END;
 $$;

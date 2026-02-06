@@ -17,7 +17,7 @@ use super::stats::{GreedySearchStats, InsertStats, PruneNeighborStats, StatsNode
 use super::storage::Storage;
 use neighbor_store::GraphNeighborStore;
 use neighbor_with_distance::{Distance, DistanceWithTieBreak, NeighborWithDistance};
-use start_nodes::{PartitionStartNodes, StartNodes};
+use start_nodes::StartNodes;
 
 pub struct ListSearchNeighbor<PD> {
     pub index_pointer: IndexPointer,
@@ -326,50 +326,18 @@ impl<'a> Graph<'a> {
         visited_nodes
     }
 
-    /// Returns a ListSearchResult initialized for streaming with partition-aware start nodes.
-    /// If partition_ids are provided, the search is restricted to those partitions.
-    /// If none of those partitions has a start node, the result is empty.
-    pub fn greedy_search_streaming_init_partitioned<S: Storage>(
+    /// Returns a ListSearchResult initialized for streaming search.
+    pub fn greedy_search_streaming_init<S: Storage>(
         &mut self,
         query: LabeledVector,
         search_list_size: usize,
-        partition_ids: Option<&[u32]>,
         storage: &S,
     ) -> ListSearchResult<S::QueryDistanceMeasure, S::LSNPrivateData> {
-        // If partition IDs are provided, treat them as a strict filter.
-        if let Some(ids) = partition_ids {
-            if let Some(partition_start_nodes) = self.meta_page.get_partition_start_nodes() {
-                let nodes = partition_start_nodes.get_for_partitions(Some(ids));
-                if nodes.is_empty() {
-                    return ListSearchResult::empty();
-                }
-                pgrx::debug1!(
-                    "Using {} partition start nodes for {} partitions",
-                    nodes.len(),
-                    ids.len()
-                );
-
-                let dm = storage.get_query_distance_measure(query);
-                let num_neighbors = self.meta_page.get_num_neighbors();
-                return ListSearchResult::new(
-                    nodes,
-                    dm,
-                    None,
-                    search_list_size,
-                    num_neighbors,
-                    self.get_neighbor_store(),
-                    storage,
-                );
-            }
+        let start_nodes = self.get_start_nodes();
+        if start_nodes.is_none() {
             return ListSearchResult::empty();
         }
-
-        // Fall back to regular start nodes if no partition nodes available
-        let regular_start = self.get_start_nodes();
-        if regular_start.is_none() {
-            return ListSearchResult::empty();
-        }
-        let start_nodes = regular_start.unwrap().get_for_node(query.labels());
+        let start_nodes = start_nodes.unwrap().get_for_node(query.labels());
 
         let dm = storage.get_query_distance_measure(query);
         let num_neighbors = self.meta_page.get_num_neighbors();
@@ -775,158 +743,4 @@ digraph G {
         }
     }
 
-    /// Insert a node using partition-aware entry points.
-    /// This method uses the partition's start node as the entry point for greedy search,
-    /// which helps ensure that nodes within the same spatial partition are well-connected.
-    #[allow(clippy::too_many_arguments)]
-    pub fn insert_partitioned<S: Storage>(
-        &mut self,
-        index: &PgRelation,
-        index_pointer: IndexPointer,
-        vec: LabeledVector,
-        partition_id: u32,
-        partition_start_nodes: &PartitionStartNodes,
-        storage: &S,
-        stats: &mut InsertStats,
-    ) {
-        // Update the regular start nodes (for non-partitioned queries)
-        self.update_start_nodes(
-            index,
-            index_pointer,
-            &vec,
-            storage,
-            &mut stats.prune_neighbor_stats,
-        );
-
-        // For labeled vectors, also do label-based insert
-        if vec.labels().is_some() {
-            self.insert_internal(index_pointer, vec.clone(), false, storage, stats);
-        }
-
-        // Insert using partition-aware search
-        self.insert_partitioned_internal(
-            index_pointer,
-            vec,
-            partition_id,
-            partition_start_nodes,
-            storage,
-            stats,
-        );
-    }
-
-    /// Internal partition-aware insert that uses the partition's start node
-    fn insert_partitioned_internal<S: Storage>(
-        &mut self,
-        index_pointer: IndexPointer,
-        vec: LabeledVector,
-        partition_id: u32,
-        partition_start_nodes: &PartitionStartNodes,
-        storage: &S,
-        stats: &mut InsertStats,
-    ) {
-        let labels = vec.labels().cloned();
-
-        // Get start nodes for this partition, falling back to default if partition has no start node
-        let start_nodes = partition_start_nodes.get_for_partitions(Some(&[partition_id]));
-
-        // If we have partition start nodes, use partition-aware search
-        // Otherwise fall back to the regular graph's start nodes
-        #[allow(clippy::mutable_key_type)]
-        let v = if !start_nodes.is_empty() {
-            self.greedy_search_for_build_with_start_nodes(
-                index_pointer,
-                vec.clone(),
-                true, // no_filter
-                start_nodes,
-                storage,
-                &mut stats.greedy_search_stats,
-            )
-        } else {
-            // Fall back to regular search if no partition start nodes
-            self.greedy_search_for_build(
-                index_pointer,
-                vec.clone(),
-                true, // no_filter
-                storage,
-                &mut stats.greedy_search_stats,
-            )
-        };
-
-        let (_, neighbor_list) = self.add_neighbors(
-            storage,
-            index_pointer,
-            labels.as_ref(),
-            v.into_iter().collect(),
-            &mut stats.prune_neighbor_stats,
-        );
-
-        // Update back pointers
-        let mut cnt_contains = 0;
-        let neighbor_list_len = neighbor_list.len();
-        for neighbor in neighbor_list {
-            let neighbor_contains_new_point = self.update_back_pointer(
-                neighbor.get_index_pointer_to_neighbor(),
-                index_pointer,
-                neighbor.get_labels(),
-                labels.as_ref(),
-                neighbor.get_distance_with_tie_break(),
-                storage,
-                &mut stats.prune_neighbor_stats,
-            );
-            if neighbor_contains_new_point {
-                cnt_contains += 1;
-            }
-        }
-        if neighbor_list_len > 0 && cnt_contains == 0 {
-            debug_assert!(
-                false,
-                "Inserted {:?} but it became an orphan (partition {})",
-                index_pointer, partition_id
-            );
-            pgrx::warning!(
-                "Inserted {:?} but it became an orphan (partition {})",
-                index_pointer,
-                partition_id
-            );
-        }
-    }
-
-    /// Greedy search for build that accepts explicit start nodes
-    #[allow(clippy::mutable_key_type)]
-    fn greedy_search_for_build_with_start_nodes<S: Storage>(
-        &mut self,
-        index_pointer: IndexPointer,
-        query: LabeledVector,
-        no_filter: bool,
-        start_nodes: Vec<ItemPointer>,
-        storage: &S,
-        stats: &mut GreedySearchStats,
-    ) -> HashSet<NeighborWithDistance> {
-        if start_nodes.is_empty() {
-            return HashSet::with_capacity(0);
-        }
-
-        let dm = storage.get_query_distance_measure(query);
-        let search_list_size = self.meta_page.get_search_list_size_for_build() as usize;
-        let num_neighbors = self.meta_page.get_num_neighbors();
-        let mut l = ListSearchResult::new(
-            start_nodes,
-            dm,
-            Some(index_pointer),
-            search_list_size,
-            num_neighbors,
-            self.get_neighbor_store(),
-            storage,
-        );
-        let mut visited_nodes = HashSet::with_capacity(search_list_size);
-        self.greedy_search_iterate(
-            &mut l,
-            search_list_size,
-            no_filter,
-            Some(&mut visited_nodes),
-            storage,
-        );
-        stats.combine(&l.stats);
-        visited_nodes
-    }
 }

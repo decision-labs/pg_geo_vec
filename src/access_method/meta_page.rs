@@ -9,15 +9,12 @@ use super::options::{
     NUM_DIMENSIONS_DEFAULT_SENTINEL, NUM_NEIGHBORS_DEFAULT_SENTINEL,
     SBQ_NUM_BITS_PER_DIMENSION_DEFAULT_SENTINEL,
 };
-use super::partition_metadata::{GlobalBBox, PartitionMetadata};
 use super::storage::StorageType;
 use super::storage_common::get_num_index_attributes;
-use crate::access_method::graph::start_nodes::{PartitionStartNodes, StartNodes};
+use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::stats::WriteStats;
-use crate::partition::BBox2D;
-use crate::partition::GridPartitioner;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType};
 use crate::util::*;
@@ -89,12 +86,6 @@ impl From<&MetaPageV1> for MetaPage {
             start_nodes: Some(start_nodes),
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels: false,
-            global_bbox: GlobalBBox::empty(),
-            num_partitions: 0,
-            partition_metadata: Vec::new(),
-            partition_start_nodes: None,
-            grid_cols: 0,
-            grid_rows: 0,
         }
     }
 }
@@ -166,12 +157,6 @@ impl From<MetaPageV2> for MetaPage {
             start_nodes: Some(start_nodes),
             quantizer_metadata: meta.quantizer_metadata,
             has_labels: false,
-            global_bbox: GlobalBBox::empty(),
-            num_partitions: 0,
-            partition_metadata: Vec::new(),
-            partition_start_nodes: None,
-            grid_cols: 0,
-            grid_rows: 0,
         }
     }
 }
@@ -221,18 +206,6 @@ pub struct MetaPage {
     quantizer_metadata: ItemPointer,
     /// Whether the index has labels
     has_labels: bool,
-    /// Global bounding box of all indexed geometries (for geo-vec index)
-    global_bbox: GlobalBBox,
-    /// Number of spatial partitions
-    num_partitions: u32,
-    /// Partition configuration and metadata
-    partition_metadata: Vec<PartitionMetadata>,
-    /// Partition start nodes - per-partition entry points for spatial search
-    partition_start_nodes: Option<PartitionStartNodes>,
-    /// Grid columns for spatial partitioning
-    grid_cols: u32,
-    /// Grid rows for spatial partitioning
-    grid_rows: u32,
 }
 
 impl MetaPage {
@@ -282,22 +255,6 @@ impl MetaPage {
 
     pub fn has_labels(&self) -> bool {
         self.has_labels
-    }
-
-    pub fn get_global_bbox(&self) -> &GlobalBBox {
-        &self.global_bbox
-    }
-
-    pub fn get_global_bbox_mut(&mut self) -> &mut GlobalBBox {
-        &mut self.global_bbox
-    }
-
-    pub fn update_global_bbox(&mut self, bbox: &BBox2D) {
-        let gbox = &mut self.global_bbox;
-        gbox.xmin = gbox.xmin.min(bbox.xmin);
-        gbox.xmax = gbox.xmax.max(bbox.xmax);
-        gbox.ymin = gbox.ymin.min(bbox.ymin);
-        gbox.ymax = gbox.ymax.max(bbox.ymax);
     }
 
     pub fn get_start_nodes(&self) -> Option<&StartNodes> {
@@ -403,12 +360,6 @@ impl MetaPage {
             start_nodes: None,
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels,
-            global_bbox: GlobalBBox::empty(),
-            num_partitions: 0,
-            partition_metadata: Vec::new(),
-            partition_start_nodes: None,
-            grid_cols: 0,
-            grid_rows: 0,
         };
 
         meta.store(index, true);
@@ -479,86 +430,5 @@ impl MetaPage {
 
     pub fn set_quantizer_metadata_pointer(&mut self, quantizer_pointer: IndexPointer) {
         self.quantizer_metadata = quantizer_pointer;
-    }
-
-    // ===== Partition-related methods =====
-
-    /// Get the partition start nodes
-    pub fn get_partition_start_nodes(&self) -> Option<&PartitionStartNodes> {
-        self.partition_start_nodes.as_ref()
-    }
-
-    /// Get mutable reference to partition start nodes
-    pub fn get_partition_start_nodes_mut(&mut self) -> Option<&mut PartitionStartNodes> {
-        self.partition_start_nodes.as_mut()
-    }
-
-    /// Set the partition start nodes
-    pub fn set_partition_start_nodes(&mut self, partition_start_nodes: PartitionStartNodes) {
-        self.partition_start_nodes = Some(partition_start_nodes);
-    }
-
-    /// Initialize partition start nodes if not already set
-    pub fn init_partition_start_nodes(&mut self) {
-        if self.partition_start_nodes.is_none() {
-            self.partition_start_nodes = Some(PartitionStartNodes::new());
-        }
-    }
-
-    /// Set grid configuration for spatial partitioning
-    pub fn set_grid_config(&mut self, cols: u32, rows: u32, num_partitions: u32) {
-        self.grid_cols = cols;
-        self.grid_rows = rows;
-        self.num_partitions = num_partitions;
-        if self.partition_metadata.len() != num_partitions as usize {
-            self.partition_metadata.clear();
-        }
-    }
-
-    /// Get the grid columns
-    pub fn get_grid_cols(&self) -> u32 {
-        self.grid_cols
-    }
-
-    /// Get the grid rows
-    pub fn get_grid_rows(&self) -> u32 {
-        self.grid_rows
-    }
-
-    /// Get the number of partitions
-    pub fn get_num_partitions(&self) -> u32 {
-        self.num_partitions
-    }
-
-    pub fn get_partition_metadata(&self) -> &[PartitionMetadata] {
-        &self.partition_metadata
-    }
-
-    pub fn get_partition_metadata_mut(&mut self) -> &mut Vec<PartitionMetadata> {
-        &mut self.partition_metadata
-    }
-
-    pub fn set_partition_metadata(&mut self, partition_metadata: Vec<PartitionMetadata>) {
-        self.num_partitions = partition_metadata.len() as u32;
-        self.partition_metadata = partition_metadata;
-    }
-
-    /// Create a GridPartitioner from the stored configuration and global bbox
-    /// Returns None if grid config is not set or global_bbox is empty
-    pub fn get_grid_partitioner(&self) -> Option<GridPartitioner> {
-        if self.grid_cols == 0 || self.grid_rows == 0 || self.global_bbox.is_empty() {
-            return None;
-        }
-
-        Some(GridPartitioner::from_config(
-            self.global_bbox.to_bbox2d(),
-            self.grid_cols,
-            self.grid_rows,
-        ))
-    }
-
-    /// Check if spatial partitioning is enabled
-    pub fn has_spatial_partitioning(&self) -> bool {
-        self.num_partitions > 0 && self.partition_start_nodes.is_some()
     }
 }

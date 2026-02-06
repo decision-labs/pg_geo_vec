@@ -14,7 +14,6 @@ use crate::access_method::graph::Graph;
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
-use crate::partition::postgis::{ensure_postgis_bbox_api, postgis_extract_bbox};
 use crate::util::ports::acquire_index_lock;
 
 use crate::access_method::GEO_VEC_DISTANCE_TYPE_PROC;
@@ -31,90 +30,13 @@ use super::labels::LabeledVector;
 use super::sbq::quantize::SbqQuantizer;
 use super::sbq::storage::SbqSpeedupStorage;
 
-use super::graph::start_nodes::PartitionStartNodes;
 use super::meta_page::MetaPage;
-use super::partition_metadata::{GlobalBBox, PartitionMetadata};
-use super::type_utils::is_geometry_column;
-use crate::partition::GridPartitioner;
 
 use super::plain::storage::PlainStorage;
 use super::sbq::SbqMeans;
 use super::storage::{Storage, StorageType};
 
 mod parallel;
-
-/// Default number of spatial partitions for geo-vec index
-pub const DEFAULT_NUM_PARTITIONS: u32 = 64;
-
-/// State for the first pass bbox collection scan
-struct BBoxScanState {
-    global_bbox: GlobalBBox,
-    tuple_count: usize,
-}
-
-impl BBoxScanState {
-    fn new() -> Self {
-        Self {
-            global_bbox: GlobalBBox::empty(),
-            tuple_count: 0,
-        }
-    }
-}
-
-/// Collect global bounding box from all geometries in the heap
-/// This is the first pass of the two-pass build process
-unsafe fn collect_global_bbox(
-    index_info: *mut pg_sys::IndexInfo,
-    heap_relation: &PgRelation,
-    index_relation: &PgRelation,
-) -> GlobalBBox {
-    let mut state = BBoxScanState::new();
-
-    pg_sys::IndexBuildHeapScan(
-        heap_relation.as_ptr(),
-        index_relation.as_ptr(),
-        index_info,
-        Some(build_callback_bbox_collect),
-        &mut state as *mut _ as *mut std::os::raw::c_void,
-    );
-
-    pgrx::debug1!(
-        "BBox collection complete: {} tuples, bbox: ({}, {}) - ({}, {})",
-        state.tuple_count,
-        state.global_bbox.xmin,
-        state.global_bbox.ymin,
-        state.global_bbox.xmax,
-        state.global_bbox.ymax
-    );
-
-    state.global_bbox
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn build_callback_bbox_collect(
-    index: pg_sys::Relation,
-    _ctid: pg_sys::ItemPointer,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
-    _tuple_is_alive: bool,
-    state: *mut std::os::raw::c_void,
-) {
-    let index_relation = PgRelation::from_pg(index);
-    let state = (state as *mut BBoxScanState).as_mut().unwrap();
-
-    if is_geometry_column(&index_relation, 1) {
-        // Extract bbox from PostGIS geometry column (column index 1)
-        let isnull_ptr = isnull.offset(1);
-        if !isnull_ptr.read() {
-            let geom_datum = values.offset(1).read();
-            if let Some(bbox) = postgis_extract_bbox(geom_datum) {
-                state.global_bbox.expand(&bbox);
-            }
-        }
-    }
-
-    state.tuple_count += 1;
-}
 
 struct SbqTrainState<'a, 'b> {
     quantizer: &'a mut SbqQuantizer,
@@ -141,94 +63,6 @@ struct BuildState<'a> {
     tape: Tape<'a>, //The tape is a memory abstraction over Postgres pages for writing data.
     graph: Graph<'a>,
     stats: InsertStats,
-}
-
-/// Build state for partitioned (two-pass) builds
-struct PartitionedBuildState<'a> {
-    memcxt: PgMemoryContexts,
-    ntuples: usize,
-    tape: Tape<'a>,
-    graph: Graph<'a>,
-    stats: InsertStats,
-    /// Grid partitioner for assigning nodes to partitions
-    partitioner: GridPartitioner,
-    /// Per-partition start nodes
-    partition_start_nodes: PartitionStartNodes,
-    /// Count of nodes in each partition (for statistics)
-    partition_counts: Vec<u64>,
-}
-
-impl<'a> PartitionedBuildState<'a> {
-    fn new(
-        index_relation: &'a PgRelation,
-        graph: Graph<'a>,
-        page_type: PageType,
-        partitioner: GridPartitioner,
-    ) -> Self {
-        let tape = unsafe { Tape::new(index_relation, page_type) };
-        let num_cells = partitioner.num_cells() as usize;
-
-        PartitionedBuildState {
-            memcxt: PgMemoryContexts::new("geo_vec partitioned build context"),
-            ntuples: 0,
-            tape,
-            graph,
-            stats: InsertStats::default(),
-            partitioner,
-            partition_start_nodes: PartitionStartNodes::new(),
-            partition_counts: vec![0; num_cells],
-        }
-    }
-
-    /// Get the partition ID for a given bbox
-    fn get_partition_id(&self, bbox: &BBox2D) -> u32 {
-        self.partitioner.partition_for_bbox(bbox)
-    }
-
-    /// Update the partition start node if this is the first node in the partition
-    fn maybe_update_partition_start(&mut self, partition_id: u32, index_pointer: ItemPointer) {
-        if !self.partition_start_nodes.has_partition(partition_id) {
-            self.partition_start_nodes
-                .set_partition_start(partition_id, index_pointer);
-        }
-        // Update partition count
-        if (partition_id as usize) < self.partition_counts.len() {
-            self.partition_counts[partition_id as usize] += 1;
-        }
-    }
-
-    /// Convert to regular BuildState (for finalization)
-    fn into_build_state(
-        self,
-    ) -> (
-        BuildState<'a>,
-        PartitionStartNodes,
-        Vec<u64>,
-        GridPartitioner,
-    ) {
-        let build_state = BuildState {
-            memcxt: self.memcxt,
-            ntuples: self.ntuples,
-            tape: self.tape,
-            graph: self.graph,
-            stats: self.stats,
-        };
-        (
-            build_state,
-            self.partition_start_nodes,
-            self.partition_counts,
-            self.partitioner,
-        )
-    }
-}
-
-/// Storage build state for partitioned builds
-enum StorageBuildStatePartitioned<'a, 'b, 'c, 'd> {
-    SbqSpeedup(
-        &'a mut SbqSpeedupStorage<'b>,
-        &'c mut PartitionedBuildState<'d>,
-    ),
-    Plain(&'a mut PlainStorage<'b>, &'c mut PartitionedBuildState<'d>),
 }
 
 /// Wrapper for BuildState that shares statistics with parallel workers
@@ -483,53 +317,6 @@ pub extern "C-unwind" fn ambuild(
     let write_stats =
         maybe_train_quantizer(index_info, &heap_relation, &index_relation, &mut meta_page);
 
-    // Check if this is a geo-vec index (has a second column that is not labels)
-    let has_geometry_column = index_relation.tuple_desc().len() > 1
-        && !meta_page.has_labels()
-        && is_geometry_column(&index_relation, 1);
-
-    // PASS 1: Collect global bounding box for spatial partitioning
-    let partitioner = if has_geometry_column {
-        ensure_postgis_bbox_api();
-        unsafe {
-            pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_COLLECTING_BBOX);
-        }
-        notice!("Collecting global bounding box for spatial partitioning...");
-
-        let global_bbox =
-            unsafe { collect_global_bbox(index_info, &heap_relation, &index_relation) };
-
-        if !global_bbox.is_empty() {
-            // Create grid partitioner from global bbox
-            let partitioner = GridPartitioner::new(global_bbox.to_bbox2d(), DEFAULT_NUM_PARTITIONS);
-
-            // Store partition config in meta page
-            meta_page.set_grid_config(
-                partitioner.grid_cols,
-                partitioner.grid_rows,
-                partitioner.num_cells(),
-            );
-            *meta_page.get_global_bbox_mut() = global_bbox;
-
-            // Initialize partition start nodes
-            meta_page.init_partition_start_nodes();
-
-            notice!(
-                "Spatial partitioning: {} cells ({}x{} grid)",
-                partitioner.num_cells(),
-                partitioner.grid_cols,
-                partitioner.grid_rows
-            );
-
-            Some(partitioner)
-        } else {
-            notice!("No valid geometries found - building index without spatial partitioning");
-            None
-        }
-    } else {
-        None
-    };
-
     unsafe {
         meta_page.store(&index_relation, false);
     };
@@ -537,7 +324,6 @@ pub extern "C-unwind" fn ambuild(
     let heap_tuples = unsafe { heap_relation.rd_rel.as_ref().unwrap().reltuples as usize };
     let workers = if cfg!(feature = "build_parallel")
         && !meta_page.has_labels()
-        && !has_geometry_column
         && meta_page.get_storage_type() == StorageType::SbqCompression
     {
         // Check if we have a forced worker count setting
@@ -665,7 +451,6 @@ pub extern "C-unwind" fn ambuild(
             write_stats,
             None,
             workers as usize,
-            partitioner,
         )
     };
 
@@ -706,12 +491,6 @@ unsafe fn aminsert_internal(
     // in meta_page, tape, and index pages.  TODO: allow more concurrency.
     acquire_index_lock(&index_relation);
     let mut meta_page = MetaPage::fetch(&index_relation);
-    let has_geometry_column = index_relation.tuple_desc().len() > 1
-        && !meta_page.has_labels()
-        && is_geometry_column(&index_relation, 1);
-    if has_geometry_column {
-        ensure_postgis_bbox_api();
-    }
 
     let vec = LabeledVector::from_datums(values, isnull, &meta_page);
     if vec.is_none() {
@@ -719,24 +498,6 @@ unsafe fn aminsert_internal(
         return false;
     }
     let vec = vec.unwrap();
-
-    // Extract geometry datum from index column 1 (second column in geo_vec index)
-    // The index columns are: 0=vector, 1=geometry
-    let geometry_datum = if has_geometry_column {
-        let isnull_ptr = isnull.offset(1);
-        if !isnull_ptr.read() {
-            // Geometry column is not null - extract it
-            let geom_datum = values.offset(1).read();
-            // Try to extract bbox using PostGIS
-            let bbox = postgis_extract_bbox(geom_datum);
-            Some(bbox.unwrap_or_else(BBox2D::empty))
-        } else {
-            // Geometry is null - use empty bbox (no spatial filtering)
-            None
-        }
-    } else {
-        None
-    };
 
     let heap_pointer = ItemPointer::with_item_pointer_data(*heap_tid);
     let mut storage = meta_page.get_storage_type();
@@ -750,7 +511,7 @@ unsafe fn aminsert_internal(
                 &plain,
                 &index_relation,
                 vec,
-                geometry_datum,
+                None,
                 heap_pointer,
                 &mut meta_page,
                 &mut stats,
@@ -767,7 +528,7 @@ unsafe fn aminsert_internal(
                 &bq,
                 &index_relation,
                 vec,
-                geometry_datum,
+                None,
                 heap_pointer,
                 &mut meta_page,
                 &mut stats,
@@ -801,76 +562,8 @@ unsafe fn insert_storage<S: Storage>(
         stats,
     );
 
-    // Keep insert behavior aligned with partitioned build:
-    // assign partition and use partition-aware graph entry points when enabled.
-    let partition_context = if meta_page.has_spatial_partitioning() {
-        let partition_id = meta_page
-            .get_grid_partitioner()
-            .map(|partitioner| partitioner.partition_for_bbox(&node_bbox));
-
-        if let Some(partition_id) = partition_id {
-            meta_page.init_partition_start_nodes();
-
-            let mut updated_meta = false;
-            if let Some(partition_start_nodes) = meta_page.get_partition_start_nodes_mut() {
-                if !partition_start_nodes.has_partition(partition_id) {
-                    partition_start_nodes.set_partition_start(partition_id, index_pointer);
-                    updated_meta = true;
-                }
-            }
-
-            if meta_page.get_partition_metadata().is_empty() {
-                if let Some(partitioner) = meta_page.get_grid_partitioner() {
-                    let mut partition_metadata =
-                        Vec::with_capacity(partitioner.num_cells() as usize);
-                    for pid in 0..partitioner.num_cells() {
-                        partition_metadata
-                            .push(PartitionMetadata::new(pid, partitioner.cell_bbox(pid)));
-                    }
-                    meta_page.set_partition_metadata(partition_metadata);
-                    updated_meta = true;
-                }
-            }
-
-            if let Some(metadata) = meta_page
-                .get_partition_metadata_mut()
-                .get_mut(partition_id as usize)
-            {
-                metadata.row_count = metadata.row_count.saturating_add(1);
-                if metadata.first_node.is_none() {
-                    metadata.first_node = Some((index_pointer.block_number, index_pointer.offset));
-                }
-                updated_meta = true;
-            }
-
-            if updated_meta {
-                unsafe {
-                    meta_page.store(index_relation, false);
-                }
-            }
-
-            Some((partition_id, meta_page.get_partition_start_nodes().cloned()))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
-    if let Some((partition_id, Some(partition_start_nodes))) = partition_context {
-        graph.insert_partitioned(
-            index_relation,
-            index_pointer,
-            vector,
-            partition_id,
-            &partition_start_nodes,
-            storage,
-            stats,
-        );
-    } else {
-        graph.insert(index_relation, index_pointer, vector, storage, stats);
-    }
+    graph.insert(index_relation, index_pointer, vector, storage, stats);
 }
 
 #[pg_guard]
@@ -1011,7 +704,6 @@ pub extern "C-unwind" fn _vectorscale_build_main(
     let index_relation = unsafe { PgRelation::from_pg(indexrel) };
     let meta_page = MetaPage::fetch(&index_relation);
 
-    // For parallel builds, we don't use partitioning yet (deferred to later phase)
     do_heap_scan(
         index_info,
         &heap_relation,
@@ -1024,7 +716,6 @@ pub extern "C-unwind" fn _vectorscale_build_main(
             tablescandesc,
         }),
         params.worker_count,
-        None, // Partitioned parallel build deferred to later phase
     );
 
     unsafe {
@@ -1041,7 +732,6 @@ fn do_heap_scan(
     mut write_stats: WriteStats,
     parallel_build_info: Option<ParallelBuildInfo>,
     worker_count: usize,
-    partitioner: Option<GridPartitioner>,
 ) -> usize {
     unsafe {
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
@@ -1137,76 +827,6 @@ fn do_heap_scan(
                 // In parallel mode, nodes are finalized during insertion via streaming
                 // Just need to handle any remaining cached nodes and update meta page
                 finalize_remaining_parallel_nodes(&mut bq, bs, index_relation, write_stats)
-            }
-        }
-    } else if let Some(grid_partitioner) = partitioner {
-        // PASS 2: Partitioned serial build using partition-aware entry points
-        let graph = Graph::new(
-            GraphNeighborStore::Builder(BuilderNeighborCache::new(
-                BUILDER_NEIGHBOR_CACHE_SIZE,
-                &meta_page,
-                worker_count,
-            )),
-            &mut meta_page,
-        );
-
-        match storage {
-            StorageType::Plain => {
-                let mut plain = PlainStorage::new_for_build(
-                    index_relation,
-                    heap_relation,
-                    graph.get_meta_page(),
-                );
-                let page_type = PlainStorage::page_type();
-                let mut bs =
-                    PartitionedBuildState::new(index_relation, graph, page_type, grid_partitioner);
-                let mut state = StorageBuildStatePartitioned::Plain(&mut plain, &mut bs);
-
-                unsafe {
-                    pg_sys::IndexBuildHeapScan(
-                        heap_relation.as_ptr(),
-                        index_relation.as_ptr(),
-                        index_info,
-                        Some(build_callback_partitioned),
-                        &mut state,
-                    );
-                }
-
-                finalize_partitioned_index_build(&mut plain, bs, index_relation, write_stats)
-            }
-            StorageType::SbqCompression => {
-                let mut bq = unsafe {
-                    SbqSpeedupStorage::new_for_build(
-                        index_relation,
-                        heap_relation,
-                        graph.get_meta_page(),
-                        &mut write_stats,
-                    )
-                };
-
-                let page_type = SbqSpeedupStorage::page_type();
-                let mut bs =
-                    PartitionedBuildState::new(index_relation, graph, page_type, grid_partitioner);
-                let mut state = StorageBuildStatePartitioned::SbqSpeedup(&mut bq, &mut bs);
-
-                unsafe {
-                    pg_sys::IndexBuildHeapScan(
-                        heap_relation.as_ptr(),
-                        index_relation.as_ptr(),
-                        index_info,
-                        Some(build_callback_partitioned),
-                        &mut state,
-                    );
-                }
-
-                unsafe {
-                    pgstat_progress_update_param(
-                        PROGRESS_CREATE_IDX_SUBPHASE,
-                        BUILD_PHASE_FINALIZING_GRAPH,
-                    );
-                }
-
-                finalize_partitioned_index_build(&mut bq, bs, index_relation, write_stats)
             }
         }
     } else {
@@ -1348,103 +968,6 @@ fn finalize_index_build<S: Storage>(
     ntuples
 }
 
-fn finalize_partitioned_index_build<S: Storage>(
-    storage: &mut S,
-    state: PartitionedBuildState,
-    index_relation: &PgRelation,
-    mut write_stats: WriteStats,
-) -> usize {
-    let (build_state, partition_start_nodes, partition_counts, partitioner) =
-        state.into_build_state();
-    let BuildState { graph, ntuples, .. } = build_state;
-    let (neighbor_store, meta_page) = graph.into_parts();
-    let cache_entries = neighbor_store.into_sorted();
-
-    for (index_pointer, entry) in cache_entries {
-        write_stats.num_nodes += 1;
-        let prune_neighbors;
-        let neighbors = if entry.neighbors.len() > meta_page.get_num_neighbors() as _ {
-            prune_neighbors = Graph::prune_neighbors(
-                meta_page.get_max_alpha(),
-                meta_page.get_num_neighbors() as _,
-                entry.labels.as_ref(),
-                entry.neighbors,
-                storage,
-                &mut write_stats.prune_stats,
-            );
-            prune_neighbors
-        } else {
-            entry.neighbors
-        };
-        write_stats.num_neighbors += neighbors.len();
-
-        storage.finalize_node_at_end_of_build(
-            index_pointer,
-            neighbors.as_slice(),
-            &mut write_stats,
-        );
-    }
-
-    // Store partition start nodes in meta page
-    meta_page.set_partition_start_nodes(partition_start_nodes);
-    let mut partition_metadata = Vec::with_capacity(partition_counts.len());
-    for (partition_id, row_count) in partition_counts.iter().enumerate() {
-        let pid = partition_id as u32;
-        let mut metadata = PartitionMetadata::new(pid, partitioner.cell_bbox(pid));
-        metadata.row_count = *row_count;
-        if let Some(start_node) = meta_page
-            .get_partition_start_nodes()
-            .and_then(|starts| starts.get_partition_node(pid))
-        {
-            metadata.first_node = Some((start_node.block_number, start_node.offset));
-        }
-        partition_metadata.push(metadata);
-    }
-    meta_page.set_partition_metadata(partition_metadata);
-
-    // Log partition distribution
-    let non_empty_partitions = partition_counts.iter().filter(|&&c| c > 0).count();
-    let max_partition_count = partition_counts.iter().max().copied().unwrap_or(0);
-    let min_non_empty = partition_counts
-        .iter()
-        .filter(|&&c| c > 0)
-        .min()
-        .copied()
-        .unwrap_or(0);
-    pgrx::debug1!(
-        "Partition distribution: {} non-empty partitions, min={}, max={}",
-        non_empty_partitions,
-        min_non_empty,
-        max_partition_count
-    );
-
-    unsafe {
-        meta_page.store(index_relation, false);
-    }
-
-    debug1!("write done (partitioned)");
-
-    let writing_took = Instant::now()
-        .duration_since(write_stats.started)
-        .as_secs_f64();
-    if write_stats.num_nodes > 0 {
-        debug1!(
-            "Writing took {}s or {}s/tuple.  Avg neighbors: {}",
-            writing_took,
-            writing_took / write_stats.num_nodes as f64,
-            write_stats.num_neighbors / write_stats.num_nodes
-        );
-    }
-
-    notice!(
-        "Indexed {} tuples with spatial partitioning ({} partitions)",
-        ntuples,
-        non_empty_partitions
-    );
-
-    ntuples
-}
-
 #[pg_guard]
 unsafe extern "C-unwind" fn build_callback_bq_train(
     _index: pg_sys::Relation,
@@ -1474,19 +997,7 @@ unsafe extern "C-unwind" fn build_callback(
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut StorageBuildState).as_mut().unwrap();
 
-    // Extract bbox only for geometry indexes (column index 1)
-    let bbox = if is_geometry_column(&index_relation, 1) {
-        let isnull_ptr = isnull.offset(1);
-        if !isnull_ptr.read() {
-            let geom_datum = values.offset(1).read();
-            let extracted_bbox = postgis_extract_bbox(geom_datum);
-            Some(extracted_bbox.unwrap_or_else(BBox2D::empty))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let bbox: Option<BBox2D> = None;
 
     match state {
         StorageBuildState::SbqSpeedup(bq, state) => {
@@ -1512,65 +1023,6 @@ unsafe extern "C-unwind" fn build_callback(
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn build_callback_partitioned(
-    index: pg_sys::Relation,
-    ctid: pg_sys::ItemPointer,
-    values: *mut pg_sys::Datum,
-    isnull: *mut bool,
-    _tuple_is_alive: bool,
-    state: *mut std::os::raw::c_void,
-) {
-    let heap_pointer = ItemPointer::with_item_pointer_data(*ctid);
-    let index_relation = PgRelation::from_pg(index);
-    let state = (state as *mut StorageBuildStatePartitioned)
-        .as_mut()
-        .unwrap();
-
-    // Extract bbox only for geometry indexes (column index 1)
-    let bbox = if is_geometry_column(&index_relation, 1) {
-        let isnull_ptr = isnull.offset(1);
-        if !isnull_ptr.read() {
-            let geom_datum = values.offset(1).read();
-            let extracted_bbox = postgis_extract_bbox(geom_datum);
-            Some(extracted_bbox.unwrap_or_else(BBox2D::empty))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    match state {
-        StorageBuildStatePartitioned::SbqSpeedup(bq, state) => {
-            let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
-            if let Some(vec) = vec {
-                build_callback_partitioned_memory_wrapper(
-                    &index_relation,
-                    heap_pointer,
-                    vec,
-                    bbox,
-                    state,
-                    *bq,
-                );
-            }
-        }
-        StorageBuildStatePartitioned::Plain(plain, state) => {
-            let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
-            if let Some(vec) = vec {
-                build_callback_partitioned_memory_wrapper(
-                    &index_relation,
-                    heap_pointer,
-                    vec,
-                    bbox,
-                    state,
-                    *plain,
-                );
-            }
-        }
-    }
-}
-
-#[pg_guard]
 unsafe extern "C-unwind" fn build_callback_parallel(
     index: pg_sys::Relation,
     ctid: pg_sys::ItemPointer,
@@ -1583,19 +1035,7 @@ unsafe extern "C-unwind" fn build_callback_parallel(
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut StorageBuildStateParallel).as_mut().unwrap();
 
-    // Parallel build currently excludes geometry indexes; keep this guarded for safety.
-    let bbox = if is_geometry_column(&index_relation, 1) {
-        let isnull_ptr = isnull.offset(1);
-        if !isnull_ptr.read() {
-            let geom_datum = values.offset(1).read();
-            let extracted_bbox = postgis_extract_bbox(geom_datum);
-            Some(extracted_bbox.unwrap_or_else(BBox2D::empty))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let bbox: Option<BBox2D> = None;
 
     match state {
         StorageBuildStateParallel::SbqSpeedup(bq, state) => {
@@ -1684,68 +1124,6 @@ fn build_callback_internal<S: Storage>(
 }
 
 #[inline(always)]
-unsafe fn build_callback_partitioned_memory_wrapper<S: Storage>(
-    index: &PgRelation,
-    heap_pointer: ItemPointer,
-    vector: LabeledVector,
-    bbox: Option<BBox2D>,
-    state: &mut PartitionedBuildState,
-    storage: &mut S,
-) {
-    let mut old_context = state.memcxt.set_as_current();
-
-    build_callback_partitioned_internal(index, heap_pointer, vector, bbox, state, storage);
-
-    old_context.set_as_current();
-    state.memcxt.reset();
-}
-
-#[inline(always)]
-fn build_callback_partitioned_internal<S: Storage>(
-    index: &PgRelation,
-    heap_pointer: ItemPointer,
-    vector: LabeledVector,
-    bbox: Option<BBox2D>,
-    state: &mut PartitionedBuildState,
-    storage: &mut S,
-) {
-    check_for_interrupts!();
-
-    state.ntuples += 1;
-
-    // Use the extracted bbox, or empty bbox if geometry was null
-    let node_bbox = bbox.unwrap_or_else(BBox2D::empty);
-
-    // Compute partition ID from bbox centroid
-    let partition_id = state.get_partition_id(&node_bbox);
-
-    let index_pointer = storage.create_node(
-        vector.vec().to_index_slice(),
-        node_bbox,
-        vector.labels().cloned(),
-        heap_pointer,
-        state.graph.get_meta_page(),
-        &mut state.tape,
-        &mut state.stats,
-    );
-
-    // Update partition start node if this is the first node in this partition
-    state.maybe_update_partition_start(partition_id, index_pointer);
-
-    // Insert using partition-aware method if partition start nodes are available,
-    // otherwise fall back to regular insert
-    state.graph.insert_partitioned(
-        index,
-        index_pointer,
-        vector,
-        partition_id,
-        &state.partition_start_nodes,
-        storage,
-        &mut state.stats,
-    );
-}
-
-#[inline(always)]
 unsafe fn build_callback_parallel_memory_wrapper<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
@@ -1818,7 +1196,6 @@ fn build_callback_parallel_internal<S: Storage>(
 }
 
 const BUILD_PHASE_TRAINING: i64 = 0;
-const BUILD_PHASE_COLLECTING_BBOX: i64 = 1;
 const BUILD_PHASE_BUILDING_GRAPH: i64 = 2;
 const BUILD_PHASE_FINALIZING_GRAPH: i64 = 3;
 
@@ -1826,7 +1203,6 @@ const BUILD_PHASE_FINALIZING_GRAPH: i64 = 3;
 pub unsafe extern "C-unwind" fn ambuildphasename(phasenum: i64) -> *mut ffi::c_char {
     match phasenum {
         BUILD_PHASE_TRAINING => "training quantizer".as_pg_cstr(),
-        BUILD_PHASE_COLLECTING_BBOX => "collecting bounding boxes".as_pg_cstr(),
         BUILD_PHASE_BUILDING_GRAPH => "building graph".as_pg_cstr(),
         BUILD_PHASE_FINALIZING_GRAPH => "finalizing graph".as_pg_cstr(),
         _ => error!("Unknown phase number {}", phasenum),
@@ -1839,9 +1215,7 @@ pub mod tests {
     use std::collections::HashSet;
 
     use crate::access_method::distance::DistanceType;
-    use crate::access_method::meta_page::MetaPage;
     use crate::partition::postgis::postgis_bbox_api_available;
-    use crate::partition::BBox2D;
     use pgrx::*;
     use serial_test::serial;
 
@@ -2712,147 +2086,6 @@ pub mod tests {
         assert_eq!(count, Some(3));
         // Clean up
         Spi::run("DROP TABLE test CASCADE;")?;
-        Ok(())
-    }
-
-    fn setup_geo_test_table(table_name: &str, index_name: &str) -> spi::Result<()> {
-        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis;")?;
-        Spi::run(
-            "DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1
-                    FROM pg_opclass c
-                    JOIN pg_am a ON a.oid = c.opcmethod
-                    WHERE c.opcname = 'geometry_geo_vec_ops'
-                    AND a.amname = 'geo_vec'
-                ) THEN
-                    CREATE OPERATOR CLASS geometry_geo_vec_ops
-                    FOR TYPE geometry USING geo_vec AS
-                    OPERATOR 1 && (geometry, geometry);
-                END IF;
-            END;
-            $$;",
-        )?;
-
-        Spi::run(&format!(
-            "DROP TABLE IF EXISTS {table_name} CASCADE;
-             CREATE TABLE {table_name} (
-                id SERIAL PRIMARY KEY,
-                embedding vector(3),
-                geom geometry(Point, 4326)
-             );",
-        ))?;
-
-        Spi::run(&format!(
-            "INSERT INTO {table_name}(embedding, geom)
-             SELECT
-                ARRAY[random()::float8, random()::float8, random()::float8]::vector(3),
-                ST_SetSRID(ST_MakePoint(random() * 10.0, random() * 10.0), 4326)
-             FROM generate_series(1, 40);",
-        ))?;
-
-        Spi::run(&format!(
-            "CREATE INDEX {index_name}
-             ON {table_name}
-             USING geo_vec (embedding vector_l2_ops, geom geometry_geo_vec_ops);",
-        ))?;
-
-        Ok(())
-    }
-
-    fn fetch_meta(index_name: &str) -> spi::Result<MetaPage> {
-        let index_oid =
-            Spi::get_one::<pg_sys::Oid>(&format!("SELECT '{index_name}'::regclass::oid"))?
-                .expect("index oid should exist");
-        let index_relation =
-            unsafe { PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid)) };
-        Ok(MetaPage::fetch(&index_relation))
-    }
-
-    #[pg_test]
-    #[serial]
-    pub unsafe fn test_geo_partition_metadata_updates_on_insert() -> spi::Result<()> {
-        if !postgis_bbox_api_available() {
-            pgrx::warning!(
-                "Skipping geo partition metadata test because PostGIS bbox API is unavailable"
-            );
-            return Ok(());
-        }
-
-        let table = "geo_meta_update_test";
-        let index = "geo_meta_update_test_idx";
-        setup_geo_test_table(table, index)?;
-
-        let meta_before = fetch_meta(index)?;
-        assert!(meta_before.has_spatial_partitioning());
-        assert!(!meta_before.get_partition_metadata().is_empty());
-        let before_count: u64 = meta_before
-            .get_partition_metadata()
-            .iter()
-            .map(|m| m.row_count)
-            .sum();
-        assert_eq!(before_count, 40);
-
-        Spi::run(&format!(
-            "INSERT INTO {table}(embedding, geom) VALUES
-                ('[0.01,0.02,0.03]'::vector(3), ST_SetSRID(ST_MakePoint(1.1, 1.2), 4326)),
-                ('[0.11,0.12,0.13]'::vector(3), ST_SetSRID(ST_MakePoint(2.1, 2.2), 4326)),
-                ('[0.21,0.22,0.23]'::vector(3), ST_SetSRID(ST_MakePoint(3.1, 3.2), 4326));",
-        ))?;
-
-        let meta_after = fetch_meta(index)?;
-        let after_count: u64 = meta_after
-            .get_partition_metadata()
-            .iter()
-            .map(|m| m.row_count)
-            .sum();
-        assert_eq!(after_count, 43);
-        assert!(meta_after
-            .get_partition_metadata()
-            .iter()
-            .any(|m| m.first_node.is_some()));
-
-        Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
-        Ok(())
-    }
-
-    #[pg_test]
-    #[serial]
-    pub unsafe fn test_geo_empty_overlap_partitions_and_query() -> spi::Result<()> {
-        if !postgis_bbox_api_available() {
-            pgrx::warning!(
-                "Skipping empty-overlap partition test because PostGIS bbox API is unavailable"
-            );
-            return Ok(());
-        }
-
-        let table = "geo_empty_overlap_test";
-        let index = "geo_empty_overlap_test_idx";
-        setup_geo_test_table(table, index)?;
-
-        let meta = fetch_meta(index)?;
-        let partitioner = meta
-            .get_grid_partitioner()
-            .expect("partitioner should be available for geo index");
-        let far_bbox = BBox2D::new(1000.0, 1001.0, 1000.0, 1001.0);
-        assert!(partitioner.overlapping_cells(&far_bbox).is_empty());
-
-        let far_count = Spi::get_one::<i64>(&format!(
-            "SET enable_seqscan = 0;
-             WITH cte AS (
-                SELECT id
-                FROM {table}
-                WHERE geom && ST_MakeEnvelope(1000, 1000, 1001, 1001, 4326)
-                ORDER BY embedding <=> '[0,0,0]'::vector(3)
-                LIMIT 10
-             )
-             SELECT count(*) FROM cte;"
-        ))?
-        .expect("count should not be null");
-        assert_eq!(far_count, 0);
-
-        Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
         Ok(())
     }
 

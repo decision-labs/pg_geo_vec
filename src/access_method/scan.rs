@@ -7,7 +7,6 @@ use crate::{
         graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
         sbq::storage::SbqSpeedupStorage,
     },
-    partition::postgis::{ensure_postgis_bbox_api, postgis_extract_bbox},
     util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
 };
 
@@ -25,10 +24,8 @@ use super::{
     },
     stats::QuantizerStats,
     storage::{Storage, StorageType},
-    type_utils::is_geometry_column,
 };
 
-use crate::partition::BBox2D;
 
 /* Be very careful not to transfer PgRelations in the state, as they can change between calls. That means we shouldn't be
 using lifetimes here. Everything should be owned */
@@ -46,8 +43,6 @@ struct TSVScanState {
     distance_fn: Option<DistanceFn>,
     meta_page: MetaPage,
     last_buffer: Option<PinnedBufferShare>,
-    /// Query bbox for spatial filtering (from PostGIS && operator)
-    query_bbox: Option<BBox2D>,
 }
 
 impl TSVScanState {
@@ -57,7 +52,6 @@ impl TSVScanState {
             distance_fn: None,
             meta_page: meta_page.clone(),
             last_buffer: None,
-            query_bbox: None,
         }
     }
 
@@ -72,9 +66,6 @@ impl TSVScanState {
         let storage = meta_page.get_storage_type();
         let distance = meta_page.get_distance_function();
 
-        // Determine which partitions to search based on query bbox
-        let partition_ids = self.get_partition_ids_for_query(&meta_page);
-
         let store_type = match storage {
             StorageType::Plain => {
                 let stats = QuantizerStats::default();
@@ -86,7 +77,6 @@ impl TSVScanState {
                     search_list_size,
                     meta_page,
                     stats,
-                    partition_ids.as_deref(),
                 );
                 StorageState::Plain(it)
             }
@@ -101,7 +91,6 @@ impl TSVScanState {
                     search_list_size,
                     meta_page,
                     stats,
-                    partition_ids.as_deref(),
                 );
                 StorageState::SbqSpeedup(quantizer, it)
             }
@@ -111,34 +100,6 @@ impl TSVScanState {
         self.distance_fn = Some(distance);
     }
 
-    /// Get partition IDs that overlap with the query bbox.
-    /// Returns None if no spatial filter or no spatial partitioning.
-    fn get_partition_ids_for_query(&self, meta_page: &MetaPage) -> Option<Vec<u32>> {
-        // Check if we have a query bbox and spatial partitioning is enabled
-        let query_bbox = self.query_bbox.as_ref()?;
-
-        if !meta_page.has_spatial_partitioning() {
-            return None;
-        }
-
-        // Get the grid partitioner
-        let partitioner = meta_page.get_grid_partitioner()?;
-
-        // Find overlapping partitions
-        let partition_ids = partitioner.overlapping_cells(query_bbox);
-
-        pgrx::debug1!(
-            "Query overlaps {} partitions: {:?}",
-            partition_ids.len(),
-            if partition_ids.len() <= 10 {
-                format!("{:?}", partition_ids)
-            } else {
-                format!("{:?}...", &partition_ids[..10])
-            }
-        );
-
-        Some(partition_ids)
-    }
 }
 
 struct ResortData {
@@ -235,18 +196,15 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         //FIXME?
         _meta_page: MetaPage,
         quantizer_stats: QuantizerStats,
-        partition_ids: Option<&[u32]>,
     ) -> Self {
         let mut meta_page = MetaPage::fetch(index);
         let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
 
         let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
 
-        // Use partition-aware search initialization when partition IDs are provided
-        let lsr = graph.greedy_search_streaming_init_partitioned(
+        let lsr = graph.greedy_search_streaming_init(
             query,
             search_list_size,
-            partition_ids,
             storage,
         );
         let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
@@ -421,33 +379,8 @@ pub extern "C-unwind" fn amrescan(
     let search_list_size = super::guc::TSV_QUERY_SEARCH_LIST_SIZE.get() as usize;
 
     let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
-    state.query_bbox = None;
 
-    // Extract query bbox from spatial filter key if present
-    if nkeys > 0
-        && !state.meta_page.has_labels()
-        && is_geometry_column(&indexrel, 1)
-        && !keys[0].sk_argument.is_null()
-    {
-        ensure_postgis_bbox_api();
-        // The key contains a geometry from the spatial filter (e.g., && operator)
-        let geom_datum = keys[0].sk_argument;
-        // SAFETY: postgis_extract_bbox handles NULL geoms and validates the geometry type
-        if let Some(bbox) = unsafe { postgis_extract_bbox(geom_datum) } {
-            state.query_bbox = Some(bbox);
-            pgrx::debug1!(
-                "Spatial filter bbox: ({}, {}) - ({}, {})",
-                bbox.xmin,
-                bbox.ymin,
-                bbox.xmax,
-                bbox.ymax
-            );
-        }
-    }
-
-    // Only pass keys to from_scan_key_data when they are label keys (not geometry keys)
-    let label_keys = if state.meta_page.has_labels() { keys } else { &[] };
-    let query = unsafe { LabeledVector::from_scan_key_data(label_keys, orderby_keys, &state.meta_page) };
+    let query = unsafe { LabeledVector::from_scan_key_data(keys, orderby_keys, &state.meta_page) };
 
     state.initialize(&indexrel, &heaprel, query, search_list_size);
 }
