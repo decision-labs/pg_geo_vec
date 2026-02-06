@@ -273,6 +273,335 @@ $$;
     ]
 );
 
+// Hybrid API installer. This function is always creatable because geometry-specific signatures
+// are emitted dynamically only when PostGIS is available.
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION @extschema@.geo_vec_install_hybrid_api()
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF to_regtype('geometry') IS NULL THEN
+        RETURN FALSE;
+    END IF;
+
+    EXECUTE $fn$
+        CREATE OR REPLACE FUNCTION @extschema@.geo_vec_hybrid_bbox_l2(
+            p_table regclass,
+            p_id_column name,
+            p_geom_column name,
+            p_embedding_column name,
+            p_query_bbox geometry,
+            p_query_embedding vector,
+            p_k integer DEFAULT 20,
+            p_candidate_limit integer DEFAULT 2000
+        )
+        RETURNS TABLE(row_id text, distance double precision)
+        LANGUAGE plpgsql
+        STABLE
+        AS $inner$
+        DECLARE
+            query_sql text;
+        BEGIN
+            IF p_k <= 0 THEN
+                RAISE EXCEPTION 'p_k must be > 0';
+            END IF;
+            IF p_candidate_limit <= 0 THEN
+                RAISE EXCEPTION 'p_candidate_limit must be > 0';
+            END IF;
+
+            query_sql := format(
+                'WITH spatial AS MATERIALIZED (
+                    SELECT (%1$I)::text AS row_id, %2$I AS embedding
+                    FROM %3$s
+                    WHERE %4$I && $1
+                    LIMIT $2
+                )
+                SELECT row_id, embedding <-> $3 AS distance
+                FROM spatial
+                ORDER BY embedding <-> $3
+                LIMIT $4',
+                p_id_column,
+                p_embedding_column,
+                p_table,
+                p_geom_column
+            );
+
+            RETURN QUERY EXECUTE query_sql
+                USING p_query_bbox, p_candidate_limit, p_query_embedding, p_k;
+        END;
+        $inner$;
+    $fn$;
+
+    EXECUTE $fn$
+        CREATE OR REPLACE FUNCTION @extschema@.geo_vec_hybrid_dwithin_l2(
+            p_table regclass,
+            p_id_column name,
+            p_geom_column name,
+            p_embedding_column name,
+            p_query_geom geometry,
+            p_radius double precision,
+            p_query_embedding vector,
+            p_k integer DEFAULT 20,
+            p_candidate_limit integer DEFAULT 2000
+        )
+        RETURNS TABLE(row_id text, distance double precision)
+        LANGUAGE plpgsql
+        STABLE
+        AS $inner$
+        DECLARE
+            query_sql text;
+        BEGIN
+            IF p_k <= 0 THEN
+                RAISE EXCEPTION 'p_k must be > 0';
+            END IF;
+            IF p_candidate_limit <= 0 THEN
+                RAISE EXCEPTION 'p_candidate_limit must be > 0';
+            END IF;
+            IF p_radius < 0 THEN
+                RAISE EXCEPTION 'p_radius must be >= 0';
+            END IF;
+
+            query_sql := format(
+                'WITH spatial AS MATERIALIZED (
+                    SELECT (%1$I)::text AS row_id, %2$I AS embedding
+                    FROM %3$s
+                    WHERE %4$I && ST_Expand($1, $2)
+                      AND ST_DWithin(%4$I, $1, $2)
+                    LIMIT $3
+                )
+                SELECT row_id, embedding <-> $4 AS distance
+                FROM spatial
+                ORDER BY embedding <-> $4
+                LIMIT $5',
+                p_id_column,
+                p_embedding_column,
+                p_table,
+                p_geom_column
+            );
+
+            RETURN QUERY EXECUTE query_sql
+                USING p_query_geom, p_radius, p_candidate_limit, p_query_embedding, p_k;
+        END;
+        $inner$;
+    $fn$;
+
+    EXECUTE $fn$
+        CREATE OR REPLACE FUNCTION @extschema@.geo_vec_hybrid_bbox_cosine(
+            p_table regclass,
+            p_id_column name,
+            p_geom_column name,
+            p_embedding_column name,
+            p_query_bbox geometry,
+            p_query_embedding vector,
+            p_k integer DEFAULT 20,
+            p_candidate_limit integer DEFAULT 2000
+        )
+        RETURNS TABLE(row_id text, distance double precision)
+        LANGUAGE plpgsql
+        STABLE
+        AS $inner$
+        DECLARE
+            query_sql text;
+        BEGIN
+            IF p_k <= 0 THEN
+                RAISE EXCEPTION 'p_k must be > 0';
+            END IF;
+            IF p_candidate_limit <= 0 THEN
+                RAISE EXCEPTION 'p_candidate_limit must be > 0';
+            END IF;
+
+            query_sql := format(
+                'WITH spatial AS MATERIALIZED (
+                    SELECT (%1$I)::text AS row_id, %2$I AS embedding
+                    FROM %3$s
+                    WHERE %4$I && $1
+                    LIMIT $2
+                )
+                SELECT row_id, embedding <=> $3 AS distance
+                FROM spatial
+                ORDER BY embedding <=> $3
+                LIMIT $4',
+                p_id_column,
+                p_embedding_column,
+                p_table,
+                p_geom_column
+            );
+
+            RETURN QUERY EXECUTE query_sql
+                USING p_query_bbox, p_candidate_limit, p_query_embedding, p_k;
+        END;
+        $inner$;
+    $fn$;
+
+    EXECUTE $fn$
+        CREATE OR REPLACE FUNCTION @extschema@.geo_vec_hybrid_dwithin_cosine(
+            p_table regclass,
+            p_id_column name,
+            p_geom_column name,
+            p_embedding_column name,
+            p_query_geom geometry,
+            p_radius double precision,
+            p_query_embedding vector,
+            p_k integer DEFAULT 20,
+            p_candidate_limit integer DEFAULT 2000
+        )
+        RETURNS TABLE(row_id text, distance double precision)
+        LANGUAGE plpgsql
+        STABLE
+        AS $inner$
+        DECLARE
+            query_sql text;
+        BEGIN
+            IF p_k <= 0 THEN
+                RAISE EXCEPTION 'p_k must be > 0';
+            END IF;
+            IF p_candidate_limit <= 0 THEN
+                RAISE EXCEPTION 'p_candidate_limit must be > 0';
+            END IF;
+            IF p_radius < 0 THEN
+                RAISE EXCEPTION 'p_radius must be >= 0';
+            END IF;
+
+            query_sql := format(
+                'WITH spatial AS MATERIALIZED (
+                    SELECT (%1$I)::text AS row_id, %2$I AS embedding
+                    FROM %3$s
+                    WHERE %4$I && ST_Expand($1, $2)
+                      AND ST_DWithin(%4$I, $1, $2)
+                    LIMIT $3
+                )
+                SELECT row_id, embedding <=> $4 AS distance
+                FROM spatial
+                ORDER BY embedding <=> $4
+                LIMIT $5',
+                p_id_column,
+                p_embedding_column,
+                p_table,
+                p_geom_column
+            );
+
+            RETURN QUERY EXECUTE query_sql
+                USING p_query_geom, p_radius, p_candidate_limit, p_query_embedding, p_k;
+        END;
+        $inner$;
+    $fn$;
+
+    EXECUTE $fn$
+        CREATE OR REPLACE FUNCTION @extschema@.geo_vec_hybrid_bbox_ip(
+            p_table regclass,
+            p_id_column name,
+            p_geom_column name,
+            p_embedding_column name,
+            p_query_bbox geometry,
+            p_query_embedding vector,
+            p_k integer DEFAULT 20,
+            p_candidate_limit integer DEFAULT 2000
+        )
+        RETURNS TABLE(row_id text, distance double precision)
+        LANGUAGE plpgsql
+        STABLE
+        AS $inner$
+        DECLARE
+            query_sql text;
+        BEGIN
+            IF p_k <= 0 THEN
+                RAISE EXCEPTION 'p_k must be > 0';
+            END IF;
+            IF p_candidate_limit <= 0 THEN
+                RAISE EXCEPTION 'p_candidate_limit must be > 0';
+            END IF;
+
+            query_sql := format(
+                'WITH spatial AS MATERIALIZED (
+                    SELECT (%1$I)::text AS row_id, %2$I AS embedding
+                    FROM %3$s
+                    WHERE %4$I && $1
+                    LIMIT $2
+                )
+                SELECT row_id, embedding <#> $3 AS distance
+                FROM spatial
+                ORDER BY embedding <#> $3
+                LIMIT $4',
+                p_id_column,
+                p_embedding_column,
+                p_table,
+                p_geom_column
+            );
+
+            RETURN QUERY EXECUTE query_sql
+                USING p_query_bbox, p_candidate_limit, p_query_embedding, p_k;
+        END;
+        $inner$;
+    $fn$;
+
+    EXECUTE $fn$
+        CREATE OR REPLACE FUNCTION @extschema@.geo_vec_hybrid_dwithin_ip(
+            p_table regclass,
+            p_id_column name,
+            p_geom_column name,
+            p_embedding_column name,
+            p_query_geom geometry,
+            p_radius double precision,
+            p_query_embedding vector,
+            p_k integer DEFAULT 20,
+            p_candidate_limit integer DEFAULT 2000
+        )
+        RETURNS TABLE(row_id text, distance double precision)
+        LANGUAGE plpgsql
+        STABLE
+        AS $inner$
+        DECLARE
+            query_sql text;
+        BEGIN
+            IF p_k <= 0 THEN
+                RAISE EXCEPTION 'p_k must be > 0';
+            END IF;
+            IF p_candidate_limit <= 0 THEN
+                RAISE EXCEPTION 'p_candidate_limit must be > 0';
+            END IF;
+            IF p_radius < 0 THEN
+                RAISE EXCEPTION 'p_radius must be >= 0';
+            END IF;
+
+            query_sql := format(
+                'WITH spatial AS MATERIALIZED (
+                    SELECT (%1$I)::text AS row_id, %2$I AS embedding
+                    FROM %3$s
+                    WHERE %4$I && ST_Expand($1, $2)
+                      AND ST_DWithin(%4$I, $1, $2)
+                    LIMIT $3
+                )
+                SELECT row_id, embedding <#> $4 AS distance
+                FROM spatial
+                ORDER BY embedding <#> $4
+                LIMIT $5',
+                p_id_column,
+                p_embedding_column,
+                p_table,
+                p_geom_column
+            );
+
+            RETURN QUERY EXECUTE query_sql
+                USING p_query_geom, p_radius, p_candidate_limit, p_query_embedding, p_k;
+        END;
+        $inner$;
+    $fn$;
+
+    RETURN TRUE;
+END;
+$$;
+
+DO $$
+BEGIN
+    PERFORM @extschema@.geo_vec_install_hybrid_api();
+END;
+$$;
+"#,
+    name = "geo_vec_hybrid_api"
+);
+
 #[pg_guard]
 pub extern "C-unwind" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
     true
@@ -391,6 +720,90 @@ mod tests {
         .expect("result was null");
 
         assert!(!result);
+        Ok(())
+    }
+
+    #[pg_test]
+    fn test_hybrid_api_installer() -> spi::Result<()> {
+        let installed = Spi::get_one::<bool>("SELECT geo_vec_install_hybrid_api();")?
+            .expect("installer result was NULL");
+        if !installed {
+            return Ok(());
+        }
+
+        Spi::run("CREATE EXTENSION IF NOT EXISTS postgis;")?;
+        Spi::run(
+            "DROP TABLE IF EXISTS geo_vec_hybrid_api_test;
+             CREATE TABLE geo_vec_hybrid_api_test (
+                id bigint PRIMARY KEY,
+                geom geometry(Point, 4326),
+                embedding vector(2)
+             );
+             INSERT INTO geo_vec_hybrid_api_test VALUES
+                (1, ST_SetSRID(ST_MakePoint(-122.401, 37.792), 4326), '[1.0,0.0]'),
+                (2, ST_SetSRID(ST_MakePoint(-122.405, 37.790), 4326), '[0.9,0.1]'),
+                (3, ST_SetSRID(ST_MakePoint(-122.500, 37.700), 4326), '[-1.0,0.0]');
+             CREATE INDEX geo_vec_hybrid_api_test_geom_idx ON geo_vec_hybrid_api_test USING gist (geom);
+             CREATE INDEX geo_vec_hybrid_api_test_vec_l2_idx
+               ON geo_vec_hybrid_api_test USING geo_vec (embedding vector_l2_ops);
+             CREATE INDEX geo_vec_hybrid_api_test_vec_cos_idx
+               ON geo_vec_hybrid_api_test USING geo_vec (embedding vector_cosine_ops);
+             CREATE INDEX geo_vec_hybrid_api_test_vec_ip_idx
+               ON geo_vec_hybrid_api_test USING geo_vec (embedding vector_ip_ops);",
+        )?;
+
+        let top_l2_id = Spi::get_one::<String>(
+            "SELECT row_id
+             FROM geo_vec_hybrid_dwithin_l2(
+                 'geo_vec_hybrid_api_test'::regclass,
+                 'id',
+                 'geom',
+                 'embedding',
+                 ST_SetSRID(ST_MakePoint(-122.401, 37.792), 4326),
+                 0.02,
+                 '[1.0,0.0]'::vector(2),
+                 1,
+                 100
+             );",
+        )?
+        .expect("hybrid query returned no rows");
+
+        let top_cos_id = Spi::get_one::<String>(
+            "SELECT row_id
+             FROM geo_vec_hybrid_dwithin_cosine(
+                 'geo_vec_hybrid_api_test'::regclass,
+                 'id',
+                 'geom',
+                 'embedding',
+                 ST_SetSRID(ST_MakePoint(-122.401, 37.792), 4326),
+                 0.02,
+                 '[1.0,0.0]'::vector(2),
+                 1,
+                 100
+             );",
+        )?
+        .expect("hybrid cosine query returned no rows");
+
+        let top_ip_id = Spi::get_one::<String>(
+            "SELECT row_id
+             FROM geo_vec_hybrid_dwithin_ip(
+                 'geo_vec_hybrid_api_test'::regclass,
+                 'id',
+                 'geom',
+                 'embedding',
+                 ST_SetSRID(ST_MakePoint(-122.401, 37.792), 4326),
+                 0.02,
+                 '[1.0,0.0]'::vector(2),
+                 1,
+                 100
+             );",
+        )?
+        .expect("hybrid inner-product query returned no rows");
+
+        assert_eq!(top_l2_id, "1");
+        assert_eq!(top_cos_id, "1");
+        assert_eq!(top_ip_id, "1");
+        Spi::run("DROP TABLE geo_vec_hybrid_api_test;")?;
         Ok(())
     }
 }

@@ -75,6 +75,56 @@ Notes:
 - For exact geometry semantics, add `ST_Intersects(...)` (or other exact predicate).
 - If the spatial window is large, consider an extra coarse cap in the CTE before vector ranking.
 
+## Hybrid Query API (SQL Helpers)
+
+`pg_geo_vec` now provides SQL helper functions for the split-index workflow:
+
+1. Ensure helper functions are installed (safe to rerun)
+```sql
+SELECT geo_vec_install_hybrid_api();
+```
+
+2. Radius-based hybrid search (`ST_DWithin` + L2 vector rank)
+```sql
+SELECT row_id, distance
+FROM geo_vec_hybrid_dwithin_l2(
+  'places'::regclass,
+  'id',
+  'geom',
+  'embedding',
+  ST_SetSRID(ST_MakePoint(-122.401, 37.792), 4326),
+  0.02,
+  '[0.1,0.2,0.3]'::vector(3),
+  20,
+  2000
+);
+```
+
+3. Bounding-box hybrid search (`&&` + L2 vector rank)
+```sql
+SELECT row_id, distance
+FROM geo_vec_hybrid_bbox_l2(
+  'places'::regclass,
+  'id',
+  'geom',
+  'embedding',
+  ST_MakeEnvelope(-122.5, 37.5, -122.0, 38.0, 4326),
+  '[0.1,0.2,0.3]'::vector(3),
+  20,
+  2000
+);
+```
+
+4. Cosine and inner-product variants use the same signatures:
+- `geo_vec_hybrid_dwithin_cosine(...)`
+- `geo_vec_hybrid_bbox_cosine(...)`
+- `geo_vec_hybrid_dwithin_ip(...)`
+- `geo_vec_hybrid_bbox_ip(...)`
+
+Parameters:
+- `k`: final top-K results returned after vector ranking.
+- `candidate_limit`: cap applied to spatial candidates before ANN rerank.
+
 ## What `geo_vec` Supports
 
 - Vector opclasses: cosine, L2, inner product
