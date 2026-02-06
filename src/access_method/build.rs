@@ -511,7 +511,6 @@ unsafe fn aminsert_internal(
                 &plain,
                 &index_relation,
                 vec,
-                None,
                 heap_pointer,
                 &mut meta_page,
                 &mut stats,
@@ -528,7 +527,6 @@ unsafe fn aminsert_internal(
                 &bq,
                 &index_relation,
                 vec,
-                None,
                 heap_pointer,
                 &mut meta_page,
                 &mut stats,
@@ -542,19 +540,15 @@ unsafe fn insert_storage<S: Storage>(
     storage: &S,
     index_relation: &PgRelation,
     vector: LabeledVector,
-    bbox: Option<BBox2D>, // Extracted from PostGIS geometry
     heap_pointer: ItemPointer,
     meta_page: &mut MetaPage,
     stats: &mut InsertStats,
 ) {
     let mut tape = Tape::resume(index_relation, S::page_type());
 
-    // Use the extracted bbox, or empty bbox if geometry was null
-    let node_bbox = bbox.unwrap_or_else(BBox2D::empty);
-
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
-        node_bbox,
+        BBox2D::empty(),
         vector.labels().cloned(),
         heap_pointer,
         meta_page,
@@ -997,26 +991,17 @@ unsafe extern "C-unwind" fn build_callback(
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut StorageBuildState).as_mut().unwrap();
 
-    let bbox: Option<BBox2D> = None;
-
     match state {
         StorageBuildState::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, bbox, state, *bq);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
             }
         }
         StorageBuildState::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(
-                    &index_relation,
-                    heap_pointer,
-                    vec,
-                    bbox,
-                    state,
-                    *plain,
-                );
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
             }
         }
     }
@@ -1035,21 +1020,14 @@ unsafe extern "C-unwind" fn build_callback_parallel(
     let index_relation = PgRelation::from_pg(index);
     let state = (state as *mut StorageBuildStateParallel).as_mut().unwrap();
 
-    let bbox: Option<BBox2D> = None;
-
     match state {
         StorageBuildStateParallel::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                let spare_vec =
-                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
-                        .unwrap();
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
-                    spare_vec,
-                    bbox,
                     state,
                     *bq,
                 );
@@ -1058,15 +1036,10 @@ unsafe extern "C-unwind" fn build_callback_parallel(
         StorageBuildStateParallel::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                let spare_vec =
-                    LabeledVector::from_datums(values, isnull, state.graph.get_meta_page())
-                        .unwrap();
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
-                    spare_vec,
-                    bbox,
                     state,
                     *plain,
                 );
@@ -1080,13 +1053,12 @@ unsafe fn build_callback_memory_wrapper<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
-    bbox: Option<BBox2D>,
     state: &mut BuildState,
     storage: &mut S,
 ) {
     let mut old_context = state.memcxt.set_as_current();
 
-    build_callback_internal(index, heap_pointer, vector, bbox, state, storage);
+    build_callback_internal(index, heap_pointer, vector, state, storage);
 
     old_context.set_as_current();
     state.memcxt.reset();
@@ -1097,7 +1069,6 @@ fn build_callback_internal<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
-    bbox: Option<BBox2D>,
     state: &mut BuildState,
     storage: &mut S,
 ) {
@@ -1105,12 +1076,9 @@ fn build_callback_internal<S: Storage>(
 
     state.ntuples += 1;
 
-    // Use the extracted bbox, or empty bbox if geometry was null
-    let node_bbox = bbox.unwrap_or_else(BBox2D::empty);
-
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
-        node_bbox,
+        BBox2D::empty(),
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
@@ -1128,22 +1096,12 @@ unsafe fn build_callback_parallel_memory_wrapper<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
-    spare_vector: LabeledVector,
-    bbox: Option<BBox2D>,
     state: &mut BuildStateParallel,
     storage: &mut S,
 ) {
     let mut old_context = state.memcxt.set_as_current();
 
-    build_callback_parallel_internal(
-        index,
-        heap_pointer,
-        vector,
-        spare_vector,
-        bbox,
-        state,
-        storage,
-    );
+    build_callback_parallel_internal(index, heap_pointer, vector, state, storage);
 
     old_context.set_as_current();
     state.memcxt.reset();
@@ -1154,8 +1112,6 @@ fn build_callback_parallel_internal<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
-    _spare_vector: LabeledVector,
-    bbox: Option<BBox2D>,
     state: &mut BuildStateParallel,
     storage: &mut S,
 ) {
@@ -1163,13 +1119,10 @@ fn build_callback_parallel_internal<S: Storage>(
 
     state.increment_ntuples();
 
-    // Use the extracted bbox, or empty bbox if geometry was null
-    let node_bbox = bbox.unwrap_or_else(BBox2D::empty);
-
     // Create node using local tape - PostgreSQL page locking handles concurrency
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
-        node_bbox,
+        BBox2D::empty(),
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
@@ -1215,9 +1168,7 @@ pub mod tests {
     use std::collections::HashSet;
 
     use crate::access_method::distance::DistanceType;
-    use crate::partition::postgis::postgis_bbox_api_available;
     use pgrx::*;
-    use serial_test::serial;
 
     //TODO: add test where inserting and querying with vectors that are all the same.
 
@@ -2089,52 +2040,4 @@ pub mod tests {
         Ok(())
     }
 
-    #[pg_test]
-    #[serial]
-    pub unsafe fn test_fail_fast_when_postgis_api_unavailable() -> spi::Result<()> {
-        let table = "geo_fail_fast_test";
-        let index = "geo_fail_fast_test_idx";
-        let _ = Spi::run(&format!("DROP TABLE IF EXISTS {table} CASCADE;"));
-
-        Spi::run(&format!(
-            "CREATE TABLE {table} (
-                embedding vector(3),
-                aux vector(3)
-            );"
-        ))?;
-
-        if postgis_bbox_api_available() {
-            Spi::run(&format!(
-                "CREATE INDEX {index}
-                 ON {table}
-                 USING geo_vec (embedding vector_l2_ops, aux vector_l2_ops);"
-            ))?;
-            Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
-            return Ok(());
-        }
-
-        let got_error = Spi::get_one::<bool>(&format!(
-            "DO $$
-             BEGIN
-                 BEGIN
-                     EXECUTE 'CREATE INDEX {index} ON {table} USING geo_vec (embedding vector_l2_ops, aux vector_l2_ops)';
-                     RAISE EXCEPTION 'expected PostGIS API error but index creation succeeded';
-                 EXCEPTION
-                     WHEN OTHERS THEN
-                         IF position('PostGIS bbox helper API is unavailable' in SQLERRM) > 0 THEN
-                             NULL;
-                         ELSE
-                             RAISE;
-                         END IF;
-                 END;
-             END
-             $$;
-             SELECT true;"
-        ))?
-        .unwrap_or(false);
-        assert!(got_error);
-
-        Spi::run(&format!("DROP TABLE {table} CASCADE;"))?;
-        Ok(())
-    }
 }

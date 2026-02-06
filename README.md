@@ -1,29 +1,20 @@
 # pg_geo_vec
 
-`pg_geo_vec` is a PostgreSQL extension that adds geospatial-aware behavior to graph-based vector indexing.
+`pg_geo_vec` is a PostgreSQL extension that provides a vector ANN index access method (`geo_vec`).
 
-It uses the `geo_vec` access method and combines:
-- vector ANN search (`ORDER BY embedding <->|<=> query_vec`)
-- spatial pruning from PostGIS geometry bounding boxes (`geom && envelope`)
+Current architecture is intentionally split:
+- vector similarity search: `geo_vec` (DiskANN-style graph index)
+- geospatial filtering: PostGIS index on `geometry` (typically `GiST`)
 
-This is intended for queries like:
-- "find nearest similar points inside this map window"
-- "semantic nearest neighbors, but only in this region"
-
-## What It Does
-
-- Stores per-row geometry bounding boxes alongside vector nodes.
-- Builds spatial partitions (uniform grid) from global geometry extent.
-- Restricts graph start nodes to overlapping partitions at query time.
-- Fails fast when the required PostGIS bbox helper API is unavailable.
+This keeps each concern on its strongest native path and avoids fragile mixed opclass behavior.
 
 ## Requirements
 
-- PostgreSQL 17+ (project currently validated on pg17)
+- PostgreSQL 17+
 - Rust toolchain
 - `cargo-pgrx`
 - PostGIS
-- Vector type support (`vector` type/opclasses used in index examples)
+- `vector` type support (for embedding columns)
 
 ## Build And Install
 
@@ -39,85 +30,64 @@ CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS geo_vec;
 ```
 
-Create a geometry opclass for spatial filtering (if not already created):
+## Recommended Index Strategy
 
+Use two indexes:
+
+1. Spatial index (PostGIS)
 ```sql
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_opclass c
-        JOIN pg_am a ON a.oid = c.opcmethod
-        WHERE c.opcname = 'geometry_geo_vec_ops'
-          AND a.amname = 'geo_vec'
-    ) THEN
-        CREATE OPERATOR CLASS geometry_geo_vec_ops
-        FOR TYPE geometry USING geo_vec AS
-        OPERATOR 1 && (geometry, geometry);
-    END IF;
-END;
-$$;
+CREATE INDEX idx_places_geom_gist
+ON places
+USING gist (geom);
 ```
 
-## Example
+2. Vector index (`geo_vec`)
+```sql
+CREATE INDEX idx_places_embedding_geo_vec
+ON places
+USING geo_vec (embedding vector_l2_ops)
+WITH (
+  num_neighbors = 50,
+  search_list_size = 100,
+  storage_layout = 'memory_optimized'
+);
+```
+
+## Query Pattern
+
+For hybrid search, prefilter spatially, then rank by vector distance:
 
 ```sql
-CREATE TABLE places (
-    id bigserial PRIMARY KEY,
-    embedding vector(3),
-    geom geometry(Point, 4326)
-);
-
-CREATE INDEX idx_places_geo
-ON places
-USING geo_vec (embedding vector_l2_ops, geom geometry_geo_vec_ops)
-WITH (
-    num_neighbors = 50,
-    search_list_size = 100,
-    storage_layout = 'memory_optimized'
-);
-
--- Spatial + vector query
+WITH spatial AS MATERIALIZED (
+  SELECT id, embedding
+  FROM places
+  WHERE geom && ST_MakeEnvelope(-122.5, 37.5, -122.0, 38.0, 4326)
+)
 SELECT id,
-       embedding <-> '[0.1, 0.2, 0.3]'::vector(3) AS dist
-FROM places
-WHERE geom && ST_MakeEnvelope(-122.5, 37.5, -122.0, 38.0, 4326)
-ORDER BY embedding <-> '[0.1, 0.2, 0.3]'::vector(3)
+       embedding <-> '[0.1,0.2,0.3]'::vector(3) AS dist
+FROM spatial
+ORDER BY embedding <-> '[0.1,0.2,0.3]'::vector(3)
 LIMIT 20;
 ```
 
-## Index Options
+Notes:
+- Use `&&` for fast bbox pruning.
+- For exact geometry semantics, add `ST_Intersects(...)` (or other exact predicate).
+- If the spatial window is large, consider an extra coarse cap in the CTE before vector ranking.
 
-The index supports standard DiskANN options used by this extension:
+## What `geo_vec` Supports
 
-- `storage_layout`: `plain` or `memory_optimized` (alias for bq compression)
-- `num_neighbors`: max graph out-degree (`-1` uses default)
-- `search_list_size`: build/search candidate width
-- `num_dimensions`: index first N dimensions (`0` = all)
-- `num_bits_per_dimension`: compression bits per dimension
-- `max_alpha`: pruning aggressiveness during build
+- Vector opclasses: cosine, L2, inner product
+- Optional label-aware vector indexing (`smallint[]` label opclass)
+- Build/query tuning via `geo_vec.*` GUCs
 
-## Spatial Behavior
+## Current Limitations
 
-At build time:
-- The extension extracts geometry bboxes via PostGIS datum helper APIs.
-- It computes a global bbox and derives a grid partitioner.
-- Rows are assigned to partitions, and partition metadata is written to meta pages.
-
-At query time:
-- The `&&` geometry predicate bbox is read from scan keys.
-- Overlapping partitions are selected.
-- Search is restricted to start nodes from those partitions.
-
-## Limitations
-
-- Spatial pruning depends on a geometry bbox helper symbol provided by PostGIS at runtime.
-- Current testing focus is pg17.
-- `cargo pgrx test` may require write access to PostgreSQL extension install paths in your environment.
+- `geo_vec` does not currently provide a production-ready single composite geometry+vector opclass path.
+- Some legacy geo-related code/tests remain from prior composite-index experiments and are being cleaned up.
+- Runtime `cargo pgrx test` behavior depends on local install/schema tooling setup.
 
 ## Development
-
-Useful commands:
 
 ```bash
 RUSTFLAGS='-C target-feature=+avx2,+fma' cargo check --no-default-features --features pg17
@@ -126,8 +96,8 @@ RUSTFLAGS='-C target-feature=+avx2,+fma' cargo test --no-default-features --feat
 
 ## Project Layout
 
-- `src/access_method/`: AM build/scan/graph/meta-page logic
-- `src/partition/`: bbox model, grid partitioning, PostGIS bbox extraction
+- `src/access_method/`: vector access method build/scan/graph/meta-page logic
+- `src/partition/`: spatial helper types and PostGIS helper integration (currently not the primary runtime path)
 - `sql/`: extension SQL definitions
 
 ## License
