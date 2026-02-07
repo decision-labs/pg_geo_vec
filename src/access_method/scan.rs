@@ -99,20 +99,53 @@ impl TSVScanState {
         let meta_page = MetaPage::fetch(index);
         let distance = meta_page.get_distance_function();
 
-        // Route to spatial scan if we have a bbox query AND a spatial cell index
+        // Three-way routing for spatial queries
         if let Some(ref qbbox) = query_bbox {
             if let Some(sci_start) = meta_page.get_spatial_cell_index_start() {
-                let store_type = Self::initialize_spatial_scan(
-                    index, &meta_page, &query, qbbox, sci_start, distance,
-                );
-                self.storage =
-                    PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(store_type);
-                self.distance_fn = Some(distance);
-                return;
+                let cell_index = Self::load_spatial_cell_index(index, sci_start);
+                let seeds_per_cell =
+                    super::guc::TSV_SPATIAL_SEEDS_PER_CELL.get().max(1) as usize;
+                let (seeds, total_candidates) =
+                    cell_index.sample_seeds_in_bbox(qbbox, seeds_per_cell);
+                let threshold =
+                    super::guc::TSV_SPATIAL_BRUTE_FORCE_THRESHOLD.get().max(0) as usize;
+
+                if total_candidates <= threshold {
+                    // Small candidate set → brute-force (100% recall)
+                    let store_type = Self::initialize_spatial_scan_from_index(
+                        index, &meta_page, &query, qbbox, &cell_index, distance,
+                    );
+                    self.storage = PgMemoryContexts::CurrentMemoryContext
+                        .leak_and_drop_on_delete(store_type);
+                    self.distance_fn = Some(distance);
+                    return;
+                } else {
+                    // Large candidate set → hybrid spatial-seeded graph search
+                    debug1!(
+                        "Spatial hybrid: {} total candidates > {} threshold, using {} seeds from {} cells",
+                        total_candidates,
+                        threshold,
+                        seeds.len(),
+                        cell_index.grid.bbox_to_cells(qbbox).len()
+                    );
+                    let store_type = Self::initialize_spatial_seeded_search(
+                        index,
+                        heap,
+                        &meta_page,
+                        query,
+                        search_list_size,
+                        query_bbox,
+                        seeds,
+                    );
+                    self.storage = PgMemoryContexts::CurrentMemoryContext
+                        .leak_and_drop_on_delete(store_type);
+                    self.distance_fn = Some(distance);
+                    return;
+                }
             }
         }
 
-        // Fall through to graph-based search
+        // Fall through to graph-based search (no bbox or no spatial cell index)
         let storage = meta_page.get_storage_type();
 
         let store_type = match storage {
@@ -151,16 +184,11 @@ impl TSVScanState {
         self.distance_fn = Some(distance);
     }
 
-    /// Initialize spatial scan: load cell index, find all nodes in bbox, compute distances, sort.
-    fn initialize_spatial_scan(
+    /// Load SpatialCellIndex from disk.
+    fn load_spatial_cell_index(
         index: &PgRelation,
-        meta_page: &MetaPage,
-        query: &LabeledVector,
-        query_bbox: &BBox2D,
         sci_start: crate::util::ItemPointer,
-        distance_fn: DistanceFn,
-    ) -> StorageState {
-        // Load SpatialCellIndex from disk
+    ) -> SpatialCellIndex {
         let mut stats = WriteStats::default();
         let mut reader =
             ChainItemReader::new(index, crate::util::page::PageType::SpatialCellIndex, &mut stats);
@@ -168,14 +196,21 @@ impl TSVScanState {
         for item in reader.read(sci_start) {
             buf.extend_from_slice(item.get_data_slice());
         }
-        let cell_index = SpatialCellIndex::deserialize_from_bytes(&buf);
+        SpatialCellIndex::deserialize_from_bytes(&buf)
+    }
 
-        // Get all node pointers in overlapping cells
+    /// Brute-force spatial scan using a pre-loaded cell index.
+    fn initialize_spatial_scan_from_index(
+        index: &PgRelation,
+        meta_page: &MetaPage,
+        query: &LabeledVector,
+        query_bbox: &BBox2D,
+        cell_index: &SpatialCellIndex,
+        distance_fn: DistanceFn,
+    ) -> StorageState {
         let node_pointers = cell_index.nodes_in_bbox(query_bbox);
-
         let query_vec = query.vec().to_index_slice();
 
-        // Compute distances for each node
         let mut results: Vec<(f32, HeapPointer, IndexPointer)> =
             Vec::with_capacity(node_pointers.len());
 
@@ -199,15 +234,12 @@ impl TSVScanState {
             }
             StorageType::SbqCompression => {
                 let mut read_stats = crate::access_method::stats::InsertStats::default();
-                // For SBQ, read the quantized vector and compute quantized distance.
-                // Load the quantizer for distance computation.
                 let quantizer =
                     unsafe { SbqMeans::load(index, meta_page, &mut read_stats.quantizer_stats) };
                 let query_bq = quantizer.quantize(query_vec);
 
                 for ip in &node_pointers {
-                    let rn =
-                        unsafe { SbqNode::read(index, *ip, has_labels, &mut read_stats) };
+                    let rn = unsafe { SbqNode::read(index, *ip, has_labels, &mut read_stats) };
                     let node = rn.get_archived_node();
                     if node.is_deleted() {
                         continue;
@@ -223,11 +255,10 @@ impl TSVScanState {
             }
         }
 
-        // Sort by distance (ascending)
         results.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         debug1!(
-            "Spatial scan: {} candidates from {} cells, {} after filtering deleted",
+            "Spatial brute-force: {} candidates from {} cells, {} after filtering deleted",
             node_pointers.len(),
             cell_index.grid.bbox_to_cells(query_bbox).len(),
             results.len()
@@ -237,6 +268,53 @@ impl TSVScanState {
             results,
             position: 0,
         })
+    }
+
+    /// Hybrid spatial-seeded graph search: use spatial seeds as entry points
+    /// into the DiskANN graph, with spatial post-filtering during traversal.
+    fn initialize_spatial_seeded_search(
+        index: &PgRelation,
+        heap: &PgRelation,
+        meta_page: &MetaPage,
+        query: LabeledVector,
+        search_list_size: usize,
+        query_bbox: Option<BBox2D>,
+        seeds: Vec<IndexPointer>,
+    ) -> StorageState {
+        let storage_type = meta_page.get_storage_type();
+
+        match storage_type {
+            StorageType::Plain => {
+                let stats = QuantizerStats::default();
+                let bq = PlainStorage::load_for_search(index, heap, meta_page);
+                let it = TSVResponseIterator::new_with_seeds(
+                    &bq,
+                    index,
+                    query,
+                    search_list_size,
+                    stats,
+                    query_bbox,
+                    seeds,
+                );
+                StorageState::Plain(it)
+            }
+            StorageType::SbqCompression => {
+                let mut stats = QuantizerStats::default();
+                let quantizer = unsafe { SbqMeans::load(index, meta_page, &mut stats) };
+                let bq =
+                    SbqSpeedupStorage::load_for_search(index, heap, &quantizer, meta_page);
+                let it = TSVResponseIterator::new_with_seeds(
+                    &bq,
+                    index,
+                    query,
+                    search_list_size,
+                    stats,
+                    query_bbox,
+                    seeds,
+                );
+                StorageState::SbqSpeedup(quantizer, it)
+            }
+        }
     }
 }
 
@@ -343,6 +421,46 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
 
         let lsr = graph.greedy_search_streaming_init(
+            query,
+            search_list_size,
+            storage,
+        );
+        let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
+
+        Self {
+            search_list_size,
+            lsr,
+            meta_page,
+            quantizer_stats,
+            resort_size,
+            resort_buffer: BinaryHeap::with_capacity(resort_size),
+            streaming_stats: StreamingStats::new(resort_size),
+            next_calls: 0,
+            next_calls_with_resort: 0,
+            full_distance_comparisons: 0,
+            has_label_filter,
+            query_bbox,
+        }
+    }
+
+    /// Create a TSVResponseIterator using explicit seed nodes instead of MetaPage start nodes.
+    /// Used by the hybrid spatial-seeded graph search path.
+    fn new_with_seeds<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
+        storage: &S,
+        index: &PgRelation,
+        query: LabeledVector,
+        search_list_size: usize,
+        quantizer_stats: QuantizerStats,
+        query_bbox: Option<BBox2D>,
+        seeds: Vec<IndexPointer>,
+    ) -> Self {
+        let mut meta_page = MetaPage::fetch(index);
+        let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
+
+        let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
+
+        let lsr = graph.greedy_search_streaming_init_with_seeds(
+            seeds,
             query,
             search_list_size,
             storage,

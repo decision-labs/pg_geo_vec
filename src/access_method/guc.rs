@@ -6,6 +6,8 @@ pub static TSV_PARALLEL_FLUSH_INTERVAL: GucSetting<f64> = GucSetting::<f64>::new
 pub static TSV_PARALLEL_INITIAL_START_NODES_COUNT: GucSetting<i32> = GucSetting::<i32>::new(1024);
 pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i32>::new(65536);
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
+pub static TSV_SPATIAL_BRUTE_FORCE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(5000);
+pub static TSV_SPATIAL_SEEDS_PER_CELL: GucSetting<i32> = GucSetting::<i32>::new(2);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -108,6 +110,42 @@ pub fn init() {
         -1,
         1024,
         GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe {
+            std::ffi::CStr::from_ptr("geo_vec.spatial_brute_force_threshold".as_pg_cstr())
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Candidate count threshold for brute-force vs hybrid spatial search".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("When a spatial+vector query has fewer candidates than this threshold, brute-force scan is used (100% recall). Above this threshold, spatial-seeded graph search is used (faster but approximate).".as_pg_cstr())
+        },
+        &TSV_SPATIAL_BRUTE_FORCE_THRESHOLD,
+        0,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe { std::ffi::CStr::from_ptr("geo_vec.spatial_seeds_per_cell".as_pg_cstr()) },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Number of seed nodes sampled per grid cell for hybrid spatial search".as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr("Controls how many evenly-spaced seed nodes are sampled from each overlapping grid cell to initialize the graph search in hybrid spatial mode.".as_pg_cstr())
+        },
+        &TSV_SPATIAL_SEEDS_PER_CELL,
+        1,
+        100,
+        GucContext::Userset,
         GucFlags::default(),
     );
 }

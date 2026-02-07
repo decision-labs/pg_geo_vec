@@ -352,6 +352,32 @@ impl<'a> Graph<'a> {
         )
     }
 
+    /// Returns a ListSearchResult initialized for streaming search, using
+    /// explicit seed nodes instead of fetching start nodes from MetaPage.
+    /// Used by the spatial-seeded hybrid search path.
+    pub fn greedy_search_streaming_init_with_seeds<S: Storage>(
+        &mut self,
+        seed_nodes: Vec<ItemPointer>,
+        query: LabeledVector,
+        search_list_size: usize,
+        storage: &S,
+    ) -> ListSearchResult<S::QueryDistanceMeasure, S::LSNPrivateData> {
+        if seed_nodes.is_empty() {
+            return ListSearchResult::empty();
+        }
+        let dm = storage.get_query_distance_measure(query);
+        let num_neighbors = self.meta_page.get_num_neighbors();
+        ListSearchResult::new(
+            seed_nodes,
+            dm,
+            None,
+            search_list_size,
+            num_neighbors,
+            self.get_neighbor_store(),
+            storage,
+        )
+    }
+
     /// Advance the state of the lsr until the closest `visit_n_closest` elements have been visited.
     pub fn greedy_search_iterate<S: Storage>(
         &mut self,
