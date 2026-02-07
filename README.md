@@ -1,154 +1,114 @@
-# pg_geo_vec
+# geo_vec
 
-`pg_geo_vec` is a PostgreSQL extension that provides a vector ANN index access method (`geo_vec`).
+A PostgreSQL extension for **combined vector similarity search + spatial filtering** using a single composite index.
 
-Current architecture is intentionally split:
-- vector similarity search: `geo_vec` (DiskANN-style graph index)
-- geospatial filtering: PostGIS index on `geometry` (typically `GiST`)
+Built on the DiskANN graph algorithm (forked from [pgvectorscale](https://github.com/timescale/pgvectorscale)), `geo_vec` adds a spatial cell index that enables fast approximate nearest neighbor queries constrained to a geographic bounding box — all in one index scan.
 
-This keeps each concern on its strongest native path and avoids fragile mixed opclass behavior.
+## Key Features
+
+- **Single composite index** for vector + geometry columns (no separate GiST index needed)
+- **Three-way query routing**: brute-force for small regions, hybrid spatial-seeded graph for large regions, pure graph for vector-only
+- **DiskANN graph** with SBQ compression for vector similarity
+- **Spatial cell index** (CSR grid) for 100% spatial recall on brute-force path
+- **Label filtering** via `smallint[]` overlap operator
+- **Coexists with pgvectorscale** — both extensions can be installed in the same database
 
 ## Requirements
 
 - PostgreSQL 17+
-- Rust toolchain
-- `cargo-pgrx`
-- PostGIS
-- `vector` type support (for embedding columns)
+- [PostGIS](https://postgis.net/)
+- [pgvector](https://github.com/pgvector/pgvector) (for the `vector` type)
+- Rust toolchain with AVX2+FMA support
+- [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx) 0.16.1
 
-## Build And Install
+## Quick Start
 
 ```bash
-cargo pgrx init --pg17 /path/to/pg_config
-cargo pgrx install --features pg17 --no-default-features
+# Build and install
+cargo pgrx init --pg17=/usr/bin/pg_config
+RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17
 ```
 
-## SQL Setup
-
 ```sql
-CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS geo_vec;
-```
+CREATE EXTENSION postgis;
+CREATE EXTENSION vector;
+CREATE EXTENSION geo_vec;
 
-## Recommended Index Strategy
+-- Create a composite index (vector + spatial)
+CREATE INDEX ON places USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops);
 
-Use two indexes:
-
-1. Spatial index (PostGIS)
-```sql
-CREATE INDEX idx_places_geom_gist
-ON places
-USING gist (geom);
-```
-
-2. Vector index (`geo_vec`)
-```sql
-CREATE INDEX idx_places_embedding_geo_vec
-ON places
-USING geo_vec (embedding vector_l2_ops)
-WITH (
-  num_neighbors = 50,
-  search_list_size = 100,
-  storage_layout = 'memory_optimized'
-);
-```
-
-## Query Pattern
-
-For hybrid search, prefilter spatially, then rank by vector distance:
-
-```sql
-WITH spatial AS MATERIALIZED (
-  SELECT id, embedding
-  FROM places
-  WHERE geom && ST_MakeEnvelope(-122.5, 37.5, -122.0, 38.0, 4326)
-)
-SELECT id,
-       embedding <-> '[0.1,0.2,0.3]'::vector(3) AS dist
-FROM spatial
-ORDER BY embedding <-> '[0.1,0.2,0.3]'::vector(3)
+-- Query: spatial filter + vector ANN in one index scan
+SELECT id, embedding <=> query_vec AS dist
+FROM places
+WHERE geom && ST_MakeEnvelope(-122.5, 37.7, -122.4, 37.8, 4326)
+ORDER BY embedding <=> query_vec
 LIMIT 20;
 ```
 
-Notes:
-- Use `&&` for fast bbox pruning.
-- For exact geometry semantics, add `ST_Intersects(...)` (or other exact predicate).
-- If the spatial window is large, consider an extra coarse cap in the CTE before vector ranking.
+See [docs/QUICKSTART.md](docs/QUICKSTART.md) for a full walkthrough and [docs/API.md](docs/API.md) for the complete API reference.
 
-## Hybrid Query API (SQL Helpers)
+## How It Works
 
-`pg_geo_vec` now provides SQL helper functions for the split-index workflow:
+When you create a `geo_vec` index on `(embedding, geom)`, the build phase constructs:
 
-1. Ensure helper functions are installed (safe to rerun)
+1. A **DiskANN graph** over all vectors (with optional SBQ compression)
+2. A **spatial cell index** — a grid-based auxiliary structure that maps geographic cells to graph nodes
+
+At query time, `geo_vec` routes spatial+vector queries through three paths:
+
+| Condition | Path | Recall | Speed |
+|---|---|---|---|
+| No bbox filter | Graph search | ~20/20 | Fastest |
+| Small bbox (< threshold candidates) | Brute-force scan | 20/20 | Fast |
+| Large bbox (>= threshold candidates) | Hybrid spatial-seeded graph | ~19-20/20 | Fast |
+
+The threshold is controlled by `geo_vec.spatial_brute_force_threshold` (default: 5000).
+
+## Benchmarks
+
+**318K rows, 384-dim vectors, cosine distance:**
+
+| Query | Path | Recall | Latency |
+|---|---|---|---|
+| Tiny bbox (~1K candidates) | Brute-force | 20/20 | 65ms |
+| Narrow bbox (~20K candidates) | Hybrid | 20/20 | 99ms |
+| Wide bbox (~180K candidates) | Hybrid | 20/20 | 61ms |
+| Pure vector | Graph | 20/20 | 37ms |
+| Wide bbox (forced brute-force) | Brute-force | 20/20 | 499ms |
+
+Hybrid search is **8x faster** than brute-force on large bounding boxes while maintaining the same recall.
+
+## pgvectorscale Coexistence
+
+`geo_vec` can be installed alongside pgvectorscale in the same database. All SQL functions are prefixed with `geo_vec_` to avoid name collisions:
+
 ```sql
-SELECT geo_vec_install_hybrid_api();
+CREATE EXTENSION geo_vec;      -- access method: geo_vec
+CREATE EXTENSION vectorscale;  -- access method: diskann
+
+-- Both work on the same table
+CREATE INDEX idx_geovec ON places USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops);
+CREATE INDEX idx_diskann ON places USING diskann (embedding vector_cosine_ops);
 ```
 
-2. Radius-based hybrid search (`ST_DWithin` + L2 vector rank)
-```sql
-SELECT row_id, distance
-FROM geo_vec_hybrid_dwithin_l2(
-  'places'::regclass,
-  'id',
-  'geom',
-  'embedding',
-  ST_SetSRID(ST_MakePoint(-122.401, 37.792), 4326),
-  0.02,
-  '[0.1,0.2,0.3]'::vector(3),
-  20,
-  2000
-);
-```
+## Documentation
 
-3. Bounding-box hybrid search (`&&` + L2 vector rank)
-```sql
-SELECT row_id, distance
-FROM geo_vec_hybrid_bbox_l2(
-  'places'::regclass,
-  'id',
-  'geom',
-  'embedding',
-  ST_MakeEnvelope(-122.5, 37.5, -122.0, 38.0, 4326),
-  '[0.1,0.2,0.3]'::vector(3),
-  20,
-  2000
-);
-```
-
-4. Cosine and inner-product variants use the same signatures:
-- `geo_vec_hybrid_dwithin_cosine(...)`
-- `geo_vec_hybrid_bbox_cosine(...)`
-- `geo_vec_hybrid_dwithin_ip(...)`
-- `geo_vec_hybrid_bbox_ip(...)`
-
-Parameters:
-- `k`: final top-K results returned after vector ranking.
-- `candidate_limit`: cap applied to spatial candidates before ANN rerank.
-
-## What `geo_vec` Supports
-
-- Vector opclasses: cosine, L2, inner product
-- Optional label-aware vector indexing (`smallint[]` label opclass)
-- Build/query tuning via `geo_vec.*` GUCs
-
-## Current Limitations
-
-- `geo_vec` does not currently provide a production-ready single composite geometry+vector opclass path.
-- Some legacy geo-related code/tests remain from prior composite-index experiments and are being cleaned up.
-- Runtime `cargo pgrx test` behavior depends on local install/schema tooling setup.
+- [Quick Start Guide](docs/QUICKSTART.md) — installation, setup, first queries
+- [API Reference](docs/API.md) — operator classes, GUC parameters, helper functions
 
 ## Development
 
 ```bash
-RUSTFLAGS='-C target-feature=+avx2,+fma' cargo check --no-default-features --features pg17
-RUSTFLAGS='-C target-feature=+avx2,+fma' cargo test --no-default-features --features pg17 --no-run
+# Build (debug)
+RUSTFLAGS="-C target-feature=+avx2,+fma" cargo build --no-default-features --features pg17
+
+# Build (release)
+RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17
+
+# Integration tests (requires podman/docker)
+podman build -t geo_vec_test -f Containerfile.test .
+podman run --rm -v $(pwd):/workspace geo_vec_test bash /workspace/test_data/ci_test.sh
 ```
-
-## Project Layout
-
-- `src/access_method/`: vector access method build/scan/graph/meta-page logic
-- `src/partition/`: spatial helper types and PostGIS helper integration (currently not the primary runtime path)
-- `sql/`: extension SQL definitions
 
 ## License
 
