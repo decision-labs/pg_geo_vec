@@ -64,21 +64,19 @@ echo ""
 echo ">>> Creating geo_vec indexes in parallel..."
 echo "    (buildings + kigoto concurrently)"
 
-# Buildings index (small, fast) — background
+# Buildings index (small, fast — serial, below parallel threshold) — background
 su postgres -c "psql -h /var/run/postgresql -d postgres -c \"
 SET maintenance_work_mem = '512MB';
 CREATE INDEX buildings_geo_vec_idx ON buildings
-    USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops)
-    WITH (storage_layout = plain);
+    USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops);
 \"" &
 PID_BUILDINGS=$!
 
-# Kigoto index (large, slow) — background
+# Kigoto index (large — parallel build with SBQ compression, 318K > 65536 threshold) — background
 su postgres -c "psql -h /var/run/postgresql -d postgres -c \"
 SET maintenance_work_mem = '2GB';
 CREATE INDEX kigoto_geo_vec_idx ON kigoto
-    USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops)
-    WITH (storage_layout = plain);
+    USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops);
 \"" &
 PID_KIGOTO=$!
 

@@ -7,14 +7,17 @@ use crate::{
         graph::neighbor_store::GraphNeighborStore,
         labels::LabeledVector,
         meta_page::MetaPage,
+        pg_vector::PgVector,
         sbq::storage::SbqSpeedupStorage,
         spatial_index::SpatialCellIndex,
+        storage_common::get_index_vector_attribute,
     },
     partition::BBox2D,
     util::{
         buffer::PinnedBufferShare,
         chain::ChainItemReader,
         ports::pgstat_count_index_scan,
+        table_slot::TableSlot,
         HeapPointer, IndexPointer,
     },
 };
@@ -95,6 +98,7 @@ impl TSVScanState {
         query: LabeledVector,
         search_list_size: usize,
         query_bbox: Option<BBox2D>,
+        snapshot: pg_sys::Snapshot,
     ) {
         let meta_page = MetaPage::fetch(index);
         let distance = meta_page.get_distance_function();
@@ -113,7 +117,7 @@ impl TSVScanState {
                 if total_candidates <= threshold {
                     // Small candidate set → brute-force (100% recall)
                     let store_type = Self::initialize_spatial_scan_from_index(
-                        index, &meta_page, &query, qbbox, &cell_index, distance,
+                        index, heap, &meta_page, &query, qbbox, &cell_index, distance, snapshot,
                     );
                     self.storage = PgMemoryContexts::CurrentMemoryContext
                         .leak_and_drop_on_delete(store_type);
@@ -200,16 +204,19 @@ impl TSVScanState {
     }
 
     /// Brute-force spatial scan using a pre-loaded cell index.
+    /// For SBQ storage, reads full vectors from the heap for exact distances.
     fn initialize_spatial_scan_from_index(
         index: &PgRelation,
+        heap: &PgRelation,
         meta_page: &MetaPage,
         query: &LabeledVector,
         query_bbox: &BBox2D,
         cell_index: &SpatialCellIndex,
         distance_fn: DistanceFn,
+        snapshot: pg_sys::Snapshot,
     ) -> StorageState {
         let node_pointers = cell_index.nodes_in_bbox(query_bbox);
-        let query_vec = query.vec().to_index_slice();
+        let query_vec_full = query.vec().to_full_slice();
 
         let mut results: Vec<(f32, HeapPointer, IndexPointer)> =
             Vec::with_capacity(node_pointers.len());
@@ -219,11 +226,23 @@ impl TSVScanState {
 
         match storage_type {
             StorageType::Plain => {
+                let query_vec = query.vec().to_index_slice();
                 let mut read_stats = crate::access_method::stats::InsertStats::default();
                 for ip in &node_pointers {
                     let rn = unsafe { PlainNode::read(index, *ip, &mut read_stats) };
                     let node = rn.get_archived_node();
                     if node.is_deleted() {
+                        continue;
+                    }
+                    // Exact bbox filter: grid cells are coarse, so filter nodes
+                    // whose actual bbox doesn't overlap the query bbox.
+                    let node_bbox = BBox2D {
+                        xmin: node.bbox.xmin,
+                        xmax: node.bbox.xmax,
+                        ymin: node.bbox.ymin,
+                        ymax: node.bbox.ymax,
+                    };
+                    if !node_bbox.is_empty() && !node_bbox.overlaps(query_bbox) {
                         continue;
                     }
                     let heap_pointer = node.get_heap_item_pointer();
@@ -233,10 +252,10 @@ impl TSVScanState {
                 }
             }
             StorageType::SbqCompression => {
+                // For SBQ, read full vectors from the heap for exact distance computation.
+                // This gives 100% recall for the brute-force path.
                 let mut read_stats = crate::access_method::stats::InsertStats::default();
-                let quantizer =
-                    unsafe { SbqMeans::load(index, meta_page, &mut read_stats.quantizer_stats) };
-                let query_bq = quantizer.quantize(query_vec);
+                let heap_attr = get_index_vector_attribute(index);
 
                 for ip in &node_pointers {
                     let rn = unsafe { SbqNode::read(index, *ip, has_labels, &mut read_stats) };
@@ -244,13 +263,31 @@ impl TSVScanState {
                     if node.is_deleted() {
                         continue;
                     }
+                    // Exact bbox filter: grid cells are coarse, so filter nodes
+                    // whose actual bbox doesn't overlap the query bbox.
+                    let node_bbox = node.get_bbox();
+                    if !node_bbox.is_empty() && !node_bbox.overlaps(query_bbox) {
+                        continue;
+                    }
                     let heap_pointer = node.get_heap_item_pointer();
-                    let bq_vector = node.get_bq_vector();
-                    let dist = crate::access_method::distance::distance_xor_optimized(
-                        bq_vector,
-                        query_bq.as_slice(),
-                    ) as f32;
-                    results.push((dist, heap_pointer, *ip));
+
+                    let slot_opt = unsafe {
+                        TableSlot::from_index_heap_pointer(
+                            heap,
+                            heap_pointer,
+                            snapshot,
+                            &mut read_stats.greedy_search_stats,
+                        )
+                    };
+                    if let Some(slot) = slot_opt {
+                        let datum = unsafe {
+                            slot.get_attribute(heap_attr)
+                                .expect("vector attribute should exist in the heap")
+                        };
+                        let vec = unsafe { PgVector::from_datum(datum, meta_page, false, true) };
+                        let dist = distance_fn(vec.to_full_slice(), query_vec_full);
+                        results.push((dist, heap_pointer, *ip));
+                    }
                 }
             }
         }
@@ -644,6 +681,7 @@ pub extern "C-unwind" fn amrescan(
     for key in all_keys {
         if key.sk_strategy == 6 {
             // Geometry && operator — extract bbox from the geometry datum
+            crate::partition::postgis::ensure_postgis_loaded();
             query_bbox = unsafe { crate::partition::postgis::postgis_extract_bbox(key.sk_argument) };
         } else {
             label_keys.push(*key);
@@ -654,7 +692,7 @@ pub extern "C-unwind" fn amrescan(
         LabeledVector::from_scan_key_data(&label_keys, orderby_keys, &state.meta_page)
     };
 
-    state.initialize(&indexrel, &heaprel, query, search_list_size, query_bbox);
+    state.initialize(&indexrel, &heaprel, query, search_list_size, query_bbox, scan.xs_snapshot);
 }
 
 #[pg_guard]

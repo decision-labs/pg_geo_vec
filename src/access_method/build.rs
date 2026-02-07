@@ -18,7 +18,7 @@ use crate::util::ports::acquire_index_lock;
 
 use crate::access_method::spatial_index::{SpatialCellIndexBuilder, SpatialGridConfig};
 use crate::access_method::GEO_VEC_DISTANCE_TYPE_PROC;
-use crate::partition::postgis::postgis_extract_bbox;
+use crate::partition::postgis::{ensure_postgis_loaded, postgis_extract_bbox};
 use crate::partition::BBox2D;
 use crate::util::chain::ChainTapeWriter;
 use crate::util::page::PageType;
@@ -35,9 +35,12 @@ use super::sbq::storage::SbqSpeedupStorage;
 
 use super::meta_page::MetaPage;
 
+use super::node::ReadableNode;
+use super::plain::node::PlainNode;
 use super::plain::storage::PlainStorage;
+use super::sbq::node::SbqNode;
 use super::sbq::SbqMeans;
-use super::storage::{Storage, StorageType};
+use super::storage::{ArchivedData, Storage, StorageType};
 
 mod parallel;
 
@@ -272,7 +275,8 @@ unsafe fn extract_bbox_from_values(
 ) -> BBox2D {
     match geom_attr_idx {
         Some(idx) if !*isnull.add(idx) => {
-            postgis_extract_bbox(*values.add(idx)).unwrap_or(BBox2D::empty())
+            let datum = *values.add(idx);
+            postgis_extract_bbox(datum).unwrap_or(BBox2D::empty())
         }
         _ => BBox2D::empty(),
     }
@@ -462,7 +466,7 @@ pub extern "C-unwind" fn ambuild(
     };
 
     let ntuples = if let Some(ParallelData { pcxt, snapshot }) = parallel_data {
-        unsafe {
+        let ntuples = unsafe {
             pg_sys::WaitForParallelWorkersToFinish(pcxt);
             let parallel_shared: *mut ParallelShared =
                 pg_sys::shm_toc_lookup((*pcxt).toc, parallel::SHM_TOC_SHARED_KEY, false)
@@ -473,7 +477,11 @@ pub extern "C-unwind" fn ambuild(
                 .load(Ordering::Relaxed);
             parallel::cleanup_parallel_context(pcxt, snapshot);
             ntuples
-        }
+        };
+        // After parallel build, traverse graph to build spatial cell index.
+        // Workers don't accumulate spatial entries, so we do it here.
+        build_spatial_index_from_graph(&index_relation, &mut meta_page);
+        ntuples
     } else {
         do_heap_scan(
             index_info,
@@ -532,6 +540,9 @@ unsafe fn aminsert_internal(
     let vec = vec.unwrap();
 
     let geom_attr_idx = MetaPage::find_geometry_attr_idx(&index_relation);
+    if geom_attr_idx.is_some() {
+        ensure_postgis_loaded();
+    }
     let bbox = extract_bbox_from_values(values, isnull, geom_attr_idx);
 
     let heap_pointer = ItemPointer::with_item_pointer_data(*heap_tid);
@@ -771,6 +782,9 @@ fn do_heap_scan(
 
     // Detect geometry column index for bbox extraction during build
     let geom_attr_idx = MetaPage::find_geometry_attr_idx(index_relation);
+    if geom_attr_idx.is_some() {
+        ensure_postgis_loaded();
+    }
 
     let storage = meta_page.get_storage_type();
 
@@ -1037,6 +1051,110 @@ fn finalize_index_build<S: Storage>(
     notice!("Indexed {} tuples", ntuples);
 
     ntuples
+}
+
+/// Build spatial cell index by traversing the graph after a parallel build.
+///
+/// Parallel workers don't accumulate spatial_entries, so after they finish
+/// the leader traverses the entire graph to collect (IndexPointer, BBox2D)
+/// pairs and builds the spatial cell index.
+fn build_spatial_index_from_graph(
+    index_relation: &PgRelation,
+    meta_page: &mut MetaPage,
+) {
+    if !meta_page.has_geometry() {
+        return;
+    }
+
+    let start_nodes = match meta_page.get_start_nodes() {
+        Some(sn) => sn.get_all_nodes(),
+        None => return,
+    };
+    if start_nodes.is_empty() {
+        return;
+    }
+
+    let storage_type = meta_page.get_storage_type();
+    let has_labels = meta_page.has_labels();
+    let mut stats = InsertStats::default();
+
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut spatial_entries: Vec<(ItemPointer, BBox2D)> = Vec::new();
+
+    for ip in &start_nodes {
+        if visited.insert(*ip) {
+            queue.push_back(*ip);
+        }
+    }
+
+    while let Some(ip) = queue.pop_front() {
+        let (bbox, neighbors) = match storage_type {
+            StorageType::SbqCompression => {
+                let rn = unsafe { SbqNode::read(index_relation, ip, has_labels, &mut stats) };
+                let node = rn.get_archived_node();
+                let bbox = node.get_bbox();
+                let neighbors: Vec<ItemPointer> = node.get_index_pointer_to_neighbors();
+                (bbox, neighbors)
+            }
+            StorageType::Plain => {
+                let rn = unsafe { PlainNode::read(index_relation, ip, &mut stats) };
+                let node = rn.get_archived_node();
+                let bbox = BBox2D {
+                    xmin: node.bbox.xmin,
+                    xmax: node.bbox.xmax,
+                    ymin: node.bbox.ymin,
+                    ymax: node.bbox.ymax,
+                };
+                let neighbors: Vec<ItemPointer> = node.get_index_pointer_to_neighbors();
+                (bbox, neighbors)
+            }
+        };
+
+        if !bbox.is_empty() {
+            spatial_entries.push((ip, bbox));
+        }
+
+        for neighbor in neighbors {
+            if neighbor.is_valid() && visited.insert(neighbor) {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+
+    if spatial_entries.is_empty() {
+        return;
+    }
+
+    // Compute extent from all entries
+    let mut extent = BBox2D::empty();
+    for (_, bbox) in &spatial_entries {
+        extent = extent.union(bbox);
+    }
+
+    let grid = SpatialGridConfig::from_extent(extent, spatial_entries.len());
+    let mut builder = SpatialCellIndexBuilder::new(grid);
+    for (ip, bbox) in &spatial_entries {
+        builder.add(*ip, bbox);
+    }
+    let cell_index = builder.build();
+
+    let bytes = cell_index.serialize_to_bytes();
+    let mut write_stats = WriteStats::default();
+    let mut tape =
+        ChainTapeWriter::new(index_relation, PageType::SpatialCellIndex, &mut write_stats);
+    let start_ip = tape.write(&bytes);
+    meta_page.set_spatial_cell_index_start(start_ip);
+
+    notice!(
+        "Built spatial cell index: {} cells, {} entries (post-parallel)",
+        cell_index.grid.num_cells(),
+        cell_index.node_pointers.len()
+    );
+
+    unsafe {
+        meta_page.store(index_relation, false);
+    }
 }
 
 #[pg_guard]

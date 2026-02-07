@@ -1,24 +1,28 @@
-use std::ffi::CString;
-use std::sync::OnceLock;
-
 use pgrx::{pg_sys, PgRelation};
 
-/// Cached OID for PostGIS geometry type. Returns InvalidOid when type is unavailable.
-pub fn geometry_type_oid() -> pg_sys::Oid {
-    static GEOMETRY_OID: OnceLock<pg_sys::Oid> = OnceLock::new();
-    *GEOMETRY_OID.get_or_init(|| {
-        let type_name = CString::new("geometry").expect("CString::new(\"geometry\") must succeed");
-        // SAFETY: TypenameGetTypid is pure catalog lookup in current backend.
-        unsafe { pg_sys::TypenameGetTypid(type_name.as_ptr()) }
-    })
-}
-
 /// True when the zero-based index attribute position is PostGIS geometry type.
+/// Uses format_type_be to look up the type name from the catalog by OID,
+/// avoiding TypenameGetTypid which can fail during index builds.
 pub fn is_geometry_column(index: &PgRelation, attr_idx: usize) -> bool {
     let tuple_desc = index.tuple_desc();
     let Some(attr) = tuple_desc.get(attr_idx) else {
         return false;
     };
-    let geom_oid = geometry_type_oid();
-    geom_oid != pg_sys::InvalidOid && attr.type_oid().value() == geom_oid
+    let oid = attr.type_oid().value();
+    if oid == pg_sys::InvalidOid {
+        return false;
+    }
+    // format_type_be may return schema-qualified name like "public.geometry"
+    let type_name = unsafe {
+        let cstr = pg_sys::format_type_be(oid);
+        std::ffi::CStr::from_ptr(cstr)
+            .to_str()
+            .unwrap_or("")
+            .to_string()
+    };
+    // Match "geometry" or "*.geometry" (schema-qualified)
+    type_name == "geometry"
+        || type_name
+            .rsplit_once('.')
+            .map_or(false, |(_, name)| name == "geometry")
 }
