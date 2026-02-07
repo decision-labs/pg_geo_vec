@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/postgres:17
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update && apt-get install -y \
+            build-essential pkg-config libssl-dev libreadline-dev zlib1g-dev \
+            curl git postgresql-server-dev-17 postgresql-17-postgis-3 \
+            postgresql-17-pgvector clang llvm \
+            && rm -rf /var/lib/apt/lists/*
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install cargo-pgrx
+        run: |
+          . $HOME/.cargo/env
+          cargo install cargo-pgrx --version 0.16.1 --locked
+
+      - name: Initialize pgrx
+        run: |
+          . $HOME/.cargo/env
+          cargo pgrx init --pg17=/usr/bin/pg_config
+
+      - name: Build extension
+        run: |
+          . $HOME/.cargo/env
+          RUSTFLAGS="-C target-feature=+avx2,+fma" cargo build --no-default-features --features pg17
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test container
+        run: docker build -t geo_vec_test -f Containerfile.test .
+
+      - name: Run integration tests
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            geo_vec_test bash /workspace/test_data/ci_test.sh
