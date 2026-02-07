@@ -1,5 +1,7 @@
 # geo_vec
 
+[![CI](https://github.com/decision-labs/pg_geo_vec/actions/workflows/ci.yml/badge.svg)](https://github.com/decision-labs/pg_geo_vec/actions/workflows/ci.yml)
+
 A PostgreSQL extension for **combined vector similarity search + spatial filtering** using a single composite index.
 
 Built on the DiskANN graph algorithm (forked from [pgvectorscale](https://github.com/timescale/pgvectorscale)), `geo_vec` adds a spatial cell index that enables fast approximate nearest neighbor queries constrained to a geographic bounding box — all in one index scan.
