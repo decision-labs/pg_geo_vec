@@ -51,8 +51,12 @@ ANALYZE buildings;
 
 # ---------- Run tests ----------
 echo ""
-echo ">>> Running integration tests..."
+echo ">>> Running spatial integration tests..."
 su postgres -c "psql -h /var/run/postgresql -d postgres -f /workspace/test_data/test_buildings_only.sql"
+
+echo ""
+echo ">>> Running label filtering tests..."
+su postgres -c "psql -h /var/run/postgresql -d postgres -f /workspace/test_data/test_label_filtering.sql"
 
 echo ""
 echo ">>> All CI tests passed!"
