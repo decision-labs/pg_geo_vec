@@ -12,20 +12,9 @@ echo ""
 echo ">>> Building extension (release)..."
 RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17 2>&1
 
-# Fix library naming mismatch
+# Verify installed .so
 PG_LIB=$(pg_config --pkglibdir)
-if [ -f "$PG_LIB/geo-vec-0.1.0.so" ] && [ ! -f "$PG_LIB/pg_geo_vec-0.1.0.so" ]; then
-    echo ">>> Fixing library symlink..."
-    ln -sf "$PG_LIB/geo-vec-0.1.0.so" "$PG_LIB/pg_geo_vec-0.1.0.so"
-fi
-# Also check the reverse
-if [ -f "$PG_LIB/pg_geo_vec-0.1.0.so" ] && [ ! -f "$PG_LIB/geo-vec-0.1.0.so" ]; then
-    ln -sf "$PG_LIB/pg_geo_vec-0.1.0.so" "$PG_LIB/geo-vec-0.1.0.so"
-fi
-
-echo ">>> Extension files:"
-ls -la "$PG_LIB"/geo*vec* "$PG_LIB"/pg_geo_vec* 2>/dev/null || true
-ls -la /usr/share/postgresql/17/extension/geo-vec* 2>/dev/null || true
+ls -la "$PG_LIB"/geo_vec* 2>/dev/null || true
 
 # Initialize and start PostgreSQL
 echo ""

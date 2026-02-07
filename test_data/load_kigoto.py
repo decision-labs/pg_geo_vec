@@ -13,7 +13,7 @@ cur = conn.cursor()
 
 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-cur.execute('CREATE EXTENSION IF NOT EXISTS "geo-vec";')
+cur.execute('CREATE EXTENSION IF NOT EXISTS geo_vec;')
 
 cur.execute("DROP TABLE IF EXISTS kigoto CASCADE;")
 cur.execute("""

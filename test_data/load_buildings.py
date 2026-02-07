@@ -16,7 +16,7 @@ cur = conn.cursor()
 # Create extensions
 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-cur.execute('CREATE EXTENSION IF NOT EXISTS "geo-vec";')
+cur.execute('CREATE EXTENSION IF NOT EXISTS geo_vec;')
 
 # Create table
 cur.execute("DROP TABLE IF EXISTS buildings CASCADE;")

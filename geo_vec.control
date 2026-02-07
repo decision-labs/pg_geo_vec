@@ -1,0 +1,6 @@
+comment = 'geo_vec: composite vector similarity + spatial filtering index'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/geo_vec'
+relocatable = false
+superuser = true
+requires = 'postgis'

@@ -20,11 +20,9 @@ echo ""
 echo ">>> Building extension (release)..."
 RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17 2>&1
 
+# Symlink .so if pgrx installs with a different name than the control file expects
 PG_LIB=$(pg_config --pkglibdir)
-[ -f "$PG_LIB/geo-vec-0.1.0.so" ] && [ ! -f "$PG_LIB/pg_geo_vec-0.1.0.so" ] && \
-    ln -sf "$PG_LIB/geo-vec-0.1.0.so" "$PG_LIB/pg_geo_vec-0.1.0.so"
-[ -f "$PG_LIB/pg_geo_vec-0.1.0.so" ] && [ ! -f "$PG_LIB/geo-vec-0.1.0.so" ] && \
-    ln -sf "$PG_LIB/pg_geo_vec-0.1.0.so" "$PG_LIB/geo-vec-0.1.0.so"
+ls -la "$PG_LIB"/geo*vec* 2>/dev/null || true
 
 # ---------- Initialize PostgreSQL ----------
 echo ""

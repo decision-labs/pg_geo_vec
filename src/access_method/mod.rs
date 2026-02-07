@@ -209,12 +209,12 @@ BEGIN
         CREATE OPERATOR CLASS vector_cosine_ops DEFAULT
         FOR TYPE vector USING geo_vec AS
 	        OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
-            FUNCTION 1 distance_type_cosine();
+            FUNCTION 1 geo_vec_distance_type_cosine();
     ELSIF have_l2_ops = 0 THEN
         -- Upgrade from 0.4.0 to 0.5.0.  Update cosine opclass to include
-        -- the distance_type_cosine function.
+        -- the geo_vec_distance_type_cosine function.
         INSERT INTO pg_amproc (oid, amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc)
-        SELECT  (select (max(oid)::int + 1)::oid from pg_amproc), c.opcfamily, c.opcintype, c.opcintype, 1, '@extschema@.distance_type_l2'::regproc
+        SELECT  (select (max(oid)::int + 1)::oid from pg_amproc), c.opcfamily, c.opcintype, c.opcintype, 1, '@extschema@.geo_vec_distance_type_l2'::regproc
         FROM pg_opclass c, pg_am a
         WHERE a.oid = c.opcmethod AND c.opcname = 'vector_cosine_ops' AND a.amname = 'geo_vec';
     END IF;
@@ -223,14 +223,14 @@ BEGIN
         CREATE OPERATOR CLASS vector_l2_ops
         FOR TYPE vector USING geo_vec AS
             OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
-            FUNCTION 1 distance_type_l2();
+            FUNCTION 1 geo_vec_distance_type_l2();
     END IF;
 
     IF have_ip_ops = 0 THEN
         CREATE OPERATOR CLASS vector_ip_ops
         FOR TYPE vector USING geo_vec AS
             OPERATOR 1 <#> (vector, vector) FOR ORDER BY float_ops,
-            FUNCTION 1 distance_type_inner_product();
+            FUNCTION 1 geo_vec_distance_type_inner_product();
     END IF;
     
     -- First, check if the && operator exists for smallint[]
@@ -244,7 +244,7 @@ BEGIN
         CREATE OPERATOR && (
             LEFTARG = smallint[],
             RIGHTARG = smallint[],
-            PROCEDURE = smallint_array_overlap,
+            PROCEDURE = geo_vec_smallint_array_overlap,
             COMMUTATOR = &&,
             RESTRICT = contsel,
             JOIN = contjoinsel
@@ -287,10 +287,10 @@ $$;
     name = "geo_vec_ops_operator",
     requires = [
         amhandler,
-        distance_type_cosine,
-        distance_type_l2,
-        distance_type_inner_product,
-        smallint_array_overlap
+        geo_vec_distance_type_cosine,
+        geo_vec_distance_type_l2,
+        geo_vec_distance_type_inner_product,
+        geo_vec_smallint_array_overlap
     ]
 );
 
@@ -631,7 +631,7 @@ pub extern "C-unwind" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
 /// Implementation of the array overlap operator (&&) for smallint arrays
 /// This function checks if two smallint arrays have at least one element in common
 #[pg_extern(immutable, parallel_safe, create_or_replace)]
-pub fn smallint_array_overlap(left: Array<i16>, right: Array<i16>) -> bool {
+pub fn geo_vec_smallint_array_overlap(left: Array<i16>, right: Array<i16>) -> bool {
     // Early return for empty arrays
     if left.is_empty() || right.is_empty() {
         return false;
