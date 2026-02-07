@@ -1,0 +1,441 @@
+=========================================
+  Kigoto 318K Benchmark v2
+=========================================
+>>> Building extension (release)...
+       Using PgConfig("pg17") and `pg_config` from /usr/bin/pg_config
+    Building extension with features pg17
+     Running command "/root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo" "build" "--lib" "--release" "--features" "pg17" "--no-default-features" "--message-format=json-render-diagnostics"
+    Finished `release` profile [optimized] target(s) in 0.17s
+  Installing extension
+     Copying control file to /usr/share/postgresql/17/extension/geo-vec.control
+     Copying shared library to /usr/lib/postgresql/17/lib/geo-vec-0.1.0.so
+  Discovered 7 SQL entities: 0 schemas (0 unique), 5 functions, 0 types, 0 enums, 2 sqls, 0 ords, 0 hashes, 0 aggregates, 0 triggers
+  Rebuilding pgrx_embed, in debug mode, for SQL generation with features pg17
+   Compiling pg_geo_vec v0.1.0 (/workspace)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.90s
+     Writing SQL entities to /usr/share/postgresql/17/extension/geo-vec--0.1.0.sql
+    Finished installing geo-vec
+>>> Initializing PostgreSQL...
+The files belonging to this database system will be owned by user "postgres".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "en_US.utf8".
+The default database encoding has accordingly been set to "UTF8".
+The default text search configuration will be set to "english".
+
+Data page checksums are disabled.
+
+fixing permissions on existing directory /var/lib/postgresql/17/main ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default "max_connections" ... 100
+selecting default "shared_buffers" ... 128MB
+selecting default time zone ... Etc/UTC
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+
+Success. You can now start the database server using:
+
+    /usr/lib/postgresql/17/bin/pg_ctl -D /var/lib/postgresql/17/main -l logfile start
+
+initdb: warning: enabling "trust" authentication for local connections
+initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+>>> Starting PostgreSQL...
+waiting for server to start.... done
+server started
+>>> Ready.
+>>> Loading kigoto data...
+Loading 318375 rows...
+  loaded 50000 rows...
+  loaded 100000 rows...
+  loaded 150000 rows...
+  loaded 200000 rows...
+  loaded 250000 rows...
+  loaded 300000 rows...
+Loaded 318375 rows into kigoto table.
+Spatial extent: x=[32.879809, 32.889311], y=[-2.507330, -2.500703]
+Done.
+>>> Creating geo_vec index...
+NOTICE:  Starting index build with num_neighbors=-1, search_list_size=100, max_alpha=1.2, storage_layout=Plain.
+NOTICE:  Indexed 318375 tuples
+SET
+CREATE INDEX
+
+>>> Running benchmark v2...
+Timing is on.
+=== Creating additional indexes ===
+CREATE INDEX
+Time: 93846.447 ms (01:33.846)
+CREATE INDEX
+Time: 446.933 ms
+ANALYZE
+Time: 224.010 ms
+
+=== INDEX SIZES ===
+     indexname      |  size   
+--------------------+---------
+ kigoto_geo_vec_idx | 622 MB
+ kigoto_gist_idx    | 13 MB
+ kigoto_hnsw_idx    | 622 MB
+ kigoto_pkey        | 7000 kB
+(4 rows)
+
+Time: 2.400 ms
+
+=== Candidate counts ===
+  bbox  | candidates 
+--------+------------
+ narrow |      20261
+ medium |      69836
+ wide   |     181803
+(3 rows)
+
+Time: 263.117 ms
+
+=== Ground truth (seq scan) ===
+SET
+Time: 0.072 ms
+SET
+Time: 0.045 ms
+SET
+Time: 0.056 ms
+SELECT 1
+Time: 86.422 ms
+SELECT 20
+Time: 107.367 ms
+SELECT 20
+Time: 102.680 ms
+SELECT 20
+Time: 97.843 ms
+SELECT 20
+Time: 103.940 ms
+
+=========================================
+  APPROACH 1: geo_vec ONLY
+=========================================
+DROP INDEX
+Time: 108.968 ms
+DROP INDEX
+Time: 3.423 ms
+SET
+Time: 0.065 ms
+SET
+Time: 0.042 ms
+SET
+Time: 0.033 ms
+SET
+Time: 0.045 ms
+--- geo_vec: Wide bbox ---
+                                                                                                                  QUERY PLAN                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=103.713..105.319 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.016..0.017 rows=1 loops=1)
+   ->  Index Scan using kigoto_geo_vec_idx on kigoto (actual time=3.640..5.243 rows=20 loops=1)
+         Index Cond: (geom && '0103000020E6100000010000000500000054E3A59BC47040403F355EBA490C04C054E3A59BC47040406ABC7493180404C0A8C64B37897140406ABC7493180404C0A8C64B37897140403F355EBA490C04C054E3A59BC47040403F355EBA490C04C0'::geometry)
+         Rows Removed by Index Recheck: 130
+         Order By: (embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.210 ms
+ Execution Time: 105.822 ms
+(9 rows)
+
+Time: 106.442 ms
+SELECT 20
+Time: 59.798 ms
+ geo_vec recall (wide) 
+-----------------------
+                    20
+(1 row)
+
+Time: 24.320 ms
+ outside_bbox_wide 
+-------------------
+                 0
+(1 row)
+
+Time: 44.831 ms
+
+--- geo_vec: Medium bbox ---
+                                                                                                                  QUERY PLAN                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=56.225..58.416 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.017..0.018 rows=1 loops=1)
+   ->  Index Scan using kigoto_geo_vec_idx on kigoto (actual time=2.987..5.174 rows=20 loops=1)
+         Index Cond: (geom && '0103000020E610000001000000050000001B2FDD24067140400AD7A3703D0A04C01B2FDD2406714040A01A2FDD240604C0C520B07268714040A01A2FDD240604C0C520B072687140400AD7A3703D0A04C01B2FDD24067140400AD7A3703D0A04C0'::geometry)
+         Rows Removed by Index Recheck: 367
+         Order By: (embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.157 ms
+ Execution Time: 58.927 ms
+(9 rows)
+
+Time: 59.377 ms
+SELECT 20
+Time: 58.900 ms
+ geo_vec recall (medium) 
+-------------------------
+                      20
+(1 row)
+
+Time: 24.153 ms
+
+--- geo_vec: Narrow bbox ---
+                                                                                                                  QUERY PLAN                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=57.115..64.288 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.018..0.019 rows=1 loops=1)
+   ->  Index Scan using kigoto_geo_vec_idx on kigoto (actual time=3.263..10.432 rows=20 loops=1)
+         Index Cond: (geom && '0103000020E61000000100000005000000FED478E926714040F0A7C64B370904C0FED478E926714040BA490C022B0704C0D34D621058714040BA490C022B0704C0D34D621058714040F0A7C64B370904C0FED478E926714040F0A7C64B370904C0'::geometry)
+         Rows Removed by Index Recheck: 1115
+         Order By: (embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.168 ms
+ Execution Time: 64.970 ms
+(9 rows)
+
+Time: 65.425 ms
+SELECT 20
+Time: 62.488 ms
+ geo_vec recall (narrow) 
+-------------------------
+                      20
+(1 row)
+
+Time: 24.130 ms
+
+--- geo_vec: Pure vector ---
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
+ Limit (actual time=36.176..36.276 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.018..0.019 rows=1 loops=1)
+   ->  Index Scan using kigoto_geo_vec_idx on kigoto (actual time=1.577..1.674 rows=20 loops=1)
+         Order By: (embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.079 ms
+ Execution Time: 36.575 ms
+(7 rows)
+
+Time: 36.914 ms
+SELECT 20
+Time: 37.214 ms
+ geo_vec recall (vector) 
+-------------------------
+                      20
+(1 row)
+
+Time: 24.174 ms
+
+=========================================
+  APPROACH 2: HNSW + GiST
+=========================================
+DROP INDEX
+Time: 100.315 ms
+CREATE INDEX
+Time: 92489.956 ms (01:32.490)
+CREATE INDEX
+Time: 419.784 ms
+ANALYZE
+Time: 192.844 ms
+SET
+Time: 0.072 ms
+SET
+Time: 0.044 ms
+SET
+Time: 0.104 ms
+SET
+Time: 0.111 ms
+--- HNSW+GiST: Wide bbox ---
+                                                                                                                QUERY PLAN                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=58.520..58.815 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.018..0.019 rows=1 loops=1)
+   ->  Index Scan using kigoto_hnsw_idx on kigoto (actual time=1.506..1.797 rows=20 loops=1)
+         Order By: (embedding <=> (InitPlan 1).col1)
+         Filter: (geom && '0103000020E6100000010000000500000054E3A59BC47040403F355EBA490C04C054E3A59BC47040406ABC7493180404C0A8C64B37897140406ABC7493180404C0A8C64B37897140403F355EBA490C04C054E3A59BC47040403F355EBA490C04C0'::geometry)
+         Rows Removed by Filter: 128
+ Planning Time: 0.564 ms
+ Execution Time: 59.355 ms
+(9 rows)
+
+Time: 60.263 ms
+SELECT 20
+Time: 57.258 ms
+ HNSW+GiST recall (wide) 
+-------------------------
+                      20
+(1 row)
+
+Time: 24.284 ms
+
+--- HNSW+GiST: Medium bbox ---
+                                                                                                                QUERY PLAN                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=54.879..54.890 rows=1 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.017..0.018 rows=1 loops=1)
+   ->  Index Scan using kigoto_hnsw_idx on kigoto (actual time=1.189..1.200 rows=1 loops=1)
+         Order By: (embedding <=> (InitPlan 1).col1)
+         Filter: (geom && '0103000020E610000001000000050000001B2FDD24067140400AD7A3703D0A04C01B2FDD2406714040A01A2FDD240604C0C520B07268714040A01A2FDD240604C0C520B072687140400AD7A3703D0A04C01B2FDD24067140400AD7A3703D0A04C0'::geometry)
+         Rows Removed by Filter: 199
+ Planning Time: 0.185 ms
+ Execution Time: 55.233 ms
+(9 rows)
+
+Time: 55.676 ms
+SELECT 1
+Time: 56.442 ms
+ HNSW+GiST recall (medium) 
+---------------------------
+                         1
+(1 row)
+
+Time: 24.211 ms
+
+--- HNSW+GiST: Narrow bbox ---
+                                                                                                                QUERY PLAN                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=55.330..55.331 rows=0 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.016..0.017 rows=1 loops=1)
+   ->  Index Scan using kigoto_hnsw_idx on kigoto (actual time=1.094..1.094 rows=0 loops=1)
+         Order By: (embedding <=> (InitPlan 1).col1)
+         Filter: (geom && '0103000020E61000000100000005000000FED478E926714040F0A7C64B370904C0FED478E926714040BA490C022B0704C0D34D621058714040BA490C022B0704C0D34D621058714040F0A7C64B370904C0FED478E926714040F0A7C64B370904C0'::geometry)
+         Rows Removed by Filter: 200
+ Planning Time: 0.176 ms
+ Execution Time: 55.698 ms
+(9 rows)
+
+Time: 56.132 ms
+SELECT 0
+Time: 56.362 ms
+ HNSW+GiST recall (narrow) 
+---------------------------
+                         0
+(1 row)
+
+Time: 24.261 ms
+
+--- HNSW: Pure vector ---
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Limit (actual time=35.958..35.973 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.017..0.018 rows=1 loops=1)
+   ->  Index Scan using kigoto_hnsw_idx on kigoto (actual time=0.962..0.975 rows=20 loops=1)
+         Order By: (embedding <=> (InitPlan 1).col1)
+ Planning Time: 0.085 ms
+ Execution Time: 36.248 ms
+(7 rows)
+
+Time: 36.566 ms
+SELECT 20
+Time: 36.764 ms
+ HNSW recall (vector) 
+----------------------
+                   20
+(1 row)
+
+Time: 24.265 ms
+
+=========================================
+  APPROACH 3: Seq scan baseline
+=========================================
+SET
+Time: 0.064 ms
+SET
+Time: 0.035 ms
+SET
+Time: 0.033 ms
+--- SeqScan: Wide ---
+                                                                                                                      QUERY PLAN                                                                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=107.639..114.025 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.004..0.005 rows=1 loops=1)
+   ->  Gather Merge (actual time=107.637..114.020 rows=20 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Sort (actual time=77.262..77.265 rows=20 loops=3)
+               Sort Key: ((kigoto.embedding <=> (InitPlan 1).col1))
+               Sort Method: top-N heapsort  Memory: 26kB
+               Worker 0:  Sort Method: top-N heapsort  Memory: 26kB
+               Worker 1:  Sort Method: top-N heapsort  Memory: 26kB
+               ->  Parallel Seq Scan on kigoto (actual time=2.217..71.684 rows=60601 loops=3)
+                     Filter: (geom && '0103000020E6100000010000000500000054E3A59BC47040403F355EBA490C04C054E3A59BC47040406ABC7493180404C0A8C64B37897140406ABC7493180404C0A8C64B37897140403F355EBA490C04C054E3A59BC47040403F355EBA490C04C0'::geometry)
+                     Rows Removed by Filter: 45524
+ Planning Time: 0.202 ms
+ Execution Time: 114.048 ms
+(16 rows)
+
+Time: 114.502 ms
+--- SeqScan: Narrow ---
+                                                                                                                      QUERY PLAN                                                                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual time=87.515..93.562 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.007..0.007 rows=1 loops=1)
+   ->  Gather Merge (actual time=87.513..93.558 rows=20 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Sort (actual time=62.234..62.236 rows=17 loops=3)
+               Sort Key: ((kigoto.embedding <=> (InitPlan 1).col1))
+               Sort Method: top-N heapsort  Memory: 26kB
+               Worker 0:  Sort Method: top-N heapsort  Memory: 26kB
+               Worker 1:  Sort Method: top-N heapsort  Memory: 26kB
+               ->  Parallel Seq Scan on kigoto (actual time=13.856..61.556 rows=6754 loops=3)
+                     Filter: (geom && '0103000020E61000000100000005000000FED478E926714040F0A7C64B370904C0FED478E926714040BA490C022B0704C0D34D621058714040BA490C022B0704C0D34D621058714040F0A7C64B370904C0FED478E926714040F0A7C64B370904C0'::geometry)
+                     Rows Removed by Filter: 99371
+ Planning Time: 0.185 ms
+ Execution Time: 93.587 ms
+(16 rows)
+
+Time: 94.036 ms
+--- SeqScan: Pure vector ---
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Limit (actual time=103.052..109.188 rows=20 loops=1)
+   InitPlan 1
+     ->  Seq Scan on query_vec (actual time=0.005..0.006 rows=1 loops=1)
+   ->  Gather Merge (actual time=103.051..109.184 rows=20 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Sort (actual time=77.373..77.374 rows=14 loops=3)
+               Sort Key: ((kigoto.embedding <=> (InitPlan 1).col1))
+               Sort Method: top-N heapsort  Memory: 26kB
+               Worker 0:  Sort Method: top-N heapsort  Memory: 26kB
+               Worker 1:  Sort Method: top-N heapsort  Memory: 26kB
+               ->  Parallel Seq Scan on kigoto (actual time=0.035..67.996 rows=106125 loops=3)
+ Planning Time: 0.084 ms
+ Execution Time: 109.207 ms
+(14 rows)
+
+Time: 109.501 ms
+
+=========================================
+  RECALL SUMMARY (out of 20)
+=========================================
+geo_vec:
+    bbox     | recall 
+-------------+--------
+ wide        |     20
+ medium      |     20
+ narrow      |     20
+ vector_only |     20
+(4 rows)
+
+Time: 0.456 ms
+
+HNSW+GiST:
+    bbox     | recall 
+-------------+--------
+ wide        |     20
+ medium      |      1
+ narrow      |      0
+ vector_only |     20
+(4 rows)
+
+Time: 0.269 ms
