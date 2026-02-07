@@ -17,7 +17,9 @@ mod sbq;
 mod scan;
 pub mod stats;
 mod storage;
+pub mod spatial_index;
 mod storage_common;
+mod type_utils;
 mod vacuum;
 
 /// Access method support function numbers
@@ -259,6 +261,25 @@ BEGIN
         CREATE OPERATOR CLASS vector_smallint_label_ops
         DEFAULT FOR TYPE smallint[] USING geo_vec AS
             OPERATOR 1 &&;
+    END IF;
+
+    -- geometry_geo_vec_ops: allows spatial filter on geometry column in geo_vec index
+    IF to_regtype('geometry') IS NOT NULL THEN
+        DECLARE have_geom_ops int;
+        BEGIN
+            SELECT count(*)
+            INTO have_geom_ops
+            FROM pg_catalog.pg_opclass c
+            WHERE c.opcname = 'geometry_geo_vec_ops'
+            AND c.opcmethod = (SELECT oid FROM pg_catalog.pg_am am WHERE am.amname = 'geo_vec')
+            AND c.opcnamespace = (SELECT oid FROM pg_catalog.pg_namespace where nspname='@extschema@');
+
+            IF have_geom_ops = 0 THEN
+                CREATE OPERATOR CLASS geometry_geo_vec_ops
+                DEFAULT FOR TYPE geometry USING geo_vec AS
+                    OPERATOR 6 &&(geometry, geometry);
+            END IF;
+        END;
     END IF;
 END;
 $$;

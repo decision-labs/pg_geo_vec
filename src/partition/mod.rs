@@ -1,6 +1,8 @@
 // Spatial partitioning module for pg_geo_vec
 // Implements RTree-like partitioning for composite vector + spatial index
 
+pub mod postgis;
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// Bounding box structure (similar to PostGIS BOX2DF)

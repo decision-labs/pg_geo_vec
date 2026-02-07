@@ -4,10 +4,19 @@ use pgrx::{pg_sys::InvalidOffsetNumber, *};
 
 use crate::{
     access_method::{
-        graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
+        graph::neighbor_store::GraphNeighborStore,
+        labels::LabeledVector,
+        meta_page::MetaPage,
         sbq::storage::SbqSpeedupStorage,
+        spatial_index::SpatialCellIndex,
     },
-    util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
+    partition::BBox2D,
+    util::{
+        buffer::PinnedBufferShare,
+        chain::ChainItemReader,
+        ports::pgstat_count_index_scan,
+        HeapPointer, IndexPointer,
+    },
 };
 
 use super::{
@@ -15,17 +24,40 @@ use super::{
     graph::{Graph, ListSearchResult},
     labels::LabelSetView,
     plain::{
+        node::PlainNode,
         storage::{PlainStorage, PlainStorageLsnPrivateData},
         PlainDistanceMeasure,
     },
     sbq::{
-        quantize::SbqQuantizer, storage::SbqSpeedupStorageLsnPrivateData, SbqMeans,
-        SbqSearchDistanceMeasure,
+        node::SbqNode,
+        quantize::SbqQuantizer,
+        storage::SbqSpeedupStorageLsnPrivateData,
+        SbqMeans, SbqSearchDistanceMeasure,
     },
-    stats::QuantizerStats,
-    storage::{Storage, StorageType},
+    stats::{QuantizerStats, WriteStats},
+    storage::{ArchivedData, Storage, StorageType},
 };
 
+use super::node::ReadableNode;
+
+/// Pre-computed spatial scan results, sorted by distance (ascending).
+struct SpatialScanState {
+    results: Vec<(f32, HeapPointer, IndexPointer)>,
+    position: usize,
+}
+
+impl SpatialScanState {
+    fn next(&mut self) -> Option<(HeapPointer, IndexPointer)> {
+        while self.position < self.results.len() {
+            let (_, hp, ip) = self.results[self.position];
+            self.position += 1;
+            if hp.offset != InvalidOffsetNumber {
+                return Some((hp, ip));
+            }
+        }
+        None
+    }
+}
 
 /* Be very careful not to transfer PgRelations in the state, as they can change between calls. That means we shouldn't be
 using lifetimes here. Everything should be owned */
@@ -35,6 +67,7 @@ enum StorageState {
         TSVResponseIterator<SbqSearchDistanceMeasure, SbqSpeedupStorageLsnPrivateData>,
     ),
     Plain(TSVResponseIterator<PlainDistanceMeasure, PlainStorageLsnPrivateData>),
+    SpatialScan(SpatialScanState),
 }
 
 /* no lifetime usage here. */
@@ -61,10 +94,26 @@ impl TSVScanState {
         heap: &PgRelation,
         query: LabeledVector,
         search_list_size: usize,
+        query_bbox: Option<BBox2D>,
     ) {
         let meta_page = MetaPage::fetch(index);
-        let storage = meta_page.get_storage_type();
         let distance = meta_page.get_distance_function();
+
+        // Route to spatial scan if we have a bbox query AND a spatial cell index
+        if let Some(ref qbbox) = query_bbox {
+            if let Some(sci_start) = meta_page.get_spatial_cell_index_start() {
+                let store_type = Self::initialize_spatial_scan(
+                    index, &meta_page, &query, qbbox, sci_start, distance,
+                );
+                self.storage =
+                    PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(store_type);
+                self.distance_fn = Some(distance);
+                return;
+            }
+        }
+
+        // Fall through to graph-based search
+        let storage = meta_page.get_storage_type();
 
         let store_type = match storage {
             StorageType::Plain => {
@@ -77,6 +126,7 @@ impl TSVScanState {
                     search_list_size,
                     meta_page,
                     stats,
+                    query_bbox,
                 );
                 StorageState::Plain(it)
             }
@@ -91,6 +141,7 @@ impl TSVScanState {
                     search_list_size,
                     meta_page,
                     stats,
+                    query_bbox,
                 );
                 StorageState::SbqSpeedup(quantizer, it)
             }
@@ -100,6 +151,93 @@ impl TSVScanState {
         self.distance_fn = Some(distance);
     }
 
+    /// Initialize spatial scan: load cell index, find all nodes in bbox, compute distances, sort.
+    fn initialize_spatial_scan(
+        index: &PgRelation,
+        meta_page: &MetaPage,
+        query: &LabeledVector,
+        query_bbox: &BBox2D,
+        sci_start: crate::util::ItemPointer,
+        distance_fn: DistanceFn,
+    ) -> StorageState {
+        // Load SpatialCellIndex from disk
+        let mut stats = WriteStats::default();
+        let mut reader =
+            ChainItemReader::new(index, crate::util::page::PageType::SpatialCellIndex, &mut stats);
+        let mut buf: Vec<u8> = Vec::new();
+        for item in reader.read(sci_start) {
+            buf.extend_from_slice(item.get_data_slice());
+        }
+        let cell_index = SpatialCellIndex::deserialize_from_bytes(&buf);
+
+        // Get all node pointers in overlapping cells
+        let node_pointers = cell_index.nodes_in_bbox(query_bbox);
+
+        let query_vec = query.vec().to_index_slice();
+
+        // Compute distances for each node
+        let mut results: Vec<(f32, HeapPointer, IndexPointer)> =
+            Vec::with_capacity(node_pointers.len());
+
+        let storage_type = meta_page.get_storage_type();
+        let has_labels = meta_page.has_labels();
+
+        match storage_type {
+            StorageType::Plain => {
+                let mut read_stats = crate::access_method::stats::InsertStats::default();
+                for ip in &node_pointers {
+                    let rn = unsafe { PlainNode::read(index, *ip, &mut read_stats) };
+                    let node = rn.get_archived_node();
+                    if node.is_deleted() {
+                        continue;
+                    }
+                    let heap_pointer = node.get_heap_item_pointer();
+                    let node_vector = node.vector.as_slice();
+                    let dist = distance_fn(node_vector, query_vec);
+                    results.push((dist, heap_pointer, *ip));
+                }
+            }
+            StorageType::SbqCompression => {
+                let mut read_stats = crate::access_method::stats::InsertStats::default();
+                // For SBQ, read the quantized vector and compute quantized distance.
+                // Load the quantizer for distance computation.
+                let quantizer =
+                    unsafe { SbqMeans::load(index, meta_page, &mut read_stats.quantizer_stats) };
+                let query_bq = quantizer.quantize(query_vec);
+
+                for ip in &node_pointers {
+                    let rn =
+                        unsafe { SbqNode::read(index, *ip, has_labels, &mut read_stats) };
+                    let node = rn.get_archived_node();
+                    if node.is_deleted() {
+                        continue;
+                    }
+                    let heap_pointer = node.get_heap_item_pointer();
+                    let bq_vector = node.get_bq_vector();
+                    let dist = crate::access_method::distance::distance_xor_optimized(
+                        bq_vector,
+                        query_bq.as_slice(),
+                    ) as f32;
+                    results.push((dist, heap_pointer, *ip));
+                }
+            }
+        }
+
+        // Sort by distance (ascending)
+        results.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+        debug1!(
+            "Spatial scan: {} candidates from {} cells, {} after filtering deleted",
+            node_pointers.len(),
+            cell_index.grid.bbox_to_cells(query_bbox).len(),
+            results.len()
+        );
+
+        StorageState::SpatialScan(SpatialScanState {
+            results,
+            position: 0,
+        })
+    }
 }
 
 struct ResortData {
@@ -185,6 +323,7 @@ struct TSVResponseIterator<QDM, PD> {
     next_calls_with_resort: i32,
     full_distance_comparisons: i32,
     has_label_filter: bool,
+    query_bbox: Option<BBox2D>,
 }
 
 impl<QDM, PD> TSVResponseIterator<QDM, PD> {
@@ -196,6 +335,7 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         //FIXME?
         _meta_page: MetaPage,
         quantizer_stats: QuantizerStats,
+        query_bbox: Option<BBox2D>,
     ) -> Self {
         let mut meta_page = MetaPage::fetch(index);
         let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
@@ -221,6 +361,7 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             next_calls_with_resort: 0,
             full_distance_comparisons: 0,
             has_label_filter,
+            query_bbox,
         }
     }
 }
@@ -233,7 +374,7 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
         self.next_calls += 1;
         let mut graph = Graph::new(GraphNeighborStore::Disk, &mut self.meta_page);
 
-        /* Iterate until we find a non-deleted tuple */
+        /* Iterate until we find a non-deleted tuple that passes spatial filter */
         loop {
             graph.greedy_search_iterate(
                 &mut self.lsr,
@@ -246,10 +387,16 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             let item = self.lsr.consume(storage);
 
             match item {
-                Some((heap_pointer, index_pointer)) => {
+                Some((heap_pointer, index_pointer, node_bbox)) => {
                     if heap_pointer.offset == InvalidOffsetNumber {
                         /* deleted tuple */
                         continue;
+                    }
+                    // Spatial filter: skip nodes outside query bbox
+                    if let Some(ref qbbox) = self.query_bbox {
+                        if !node_bbox.is_empty() && !node_bbox.overlaps(qbbox) {
+                            continue;
+                        }
                     }
                     return Some((heap_pointer, index_pointer));
                 }
@@ -309,15 +456,6 @@ impl<QDM, PD> TSVResponseIterator<QDM, PD> {
             }
         }
 
-        /*error!(
-            "Resort buffer size: {}, mean: {}, variance: {}, max_distance: {}: diff: {}",
-            self.resort_buffer.len(),
-            self.streaming_stats.mean(),
-            self.streaming_stats.variance().sqrt(),
-            self.streaming_stats.max_distance,
-            self.streaming_stats.max_distance - self.resort_buffer.peek().unwrap().distance
-        );*/
-
         self.resort_buffer
             .pop()
             .map(|rd| (rd.heap_pointer, rd.index_pointer))
@@ -360,7 +498,8 @@ pub extern "C-unwind" fn amrescan(
     norderbys: ::std::os::raw::c_int,
 ) {
     assert_eq!(norderbys, 1, "Expected a single order-by key");
-    assert!(nkeys == 0 || nkeys == 1, "Expected 0 or 1 keys");
+    // nkeys can be 0 (no filter), 1 (label OR geometry), or 2 (label AND geometry)
+    assert!(nkeys <= 2, "Expected 0, 1, or 2 keys");
 
     let mut scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
     let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
@@ -373,16 +512,31 @@ pub extern "C-unwind" fn amrescan(
     let orderby_keys = unsafe {
         std::slice::from_raw_parts(orderbys as *const pg_sys::ScanKeyData, norderbys as _)
     };
-    let keys =
+    let all_keys =
         unsafe { std::slice::from_raw_parts(keys as *const pg_sys::ScanKeyData, nkeys as _) };
 
     let search_list_size = super::guc::TSV_QUERY_SEARCH_LIST_SIZE.get() as usize;
 
     let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
 
-    let query = unsafe { LabeledVector::from_scan_key_data(keys, orderby_keys, &state.meta_page) };
+    // Separate geometry keys (strategy 6) from label keys (strategy 1)
+    let mut label_keys: Vec<pg_sys::ScanKeyData> = Vec::new();
+    let mut query_bbox: Option<BBox2D> = None;
 
-    state.initialize(&indexrel, &heaprel, query, search_list_size);
+    for key in all_keys {
+        if key.sk_strategy == 6 {
+            // Geometry && operator — extract bbox from the geometry datum
+            query_bbox = unsafe { crate::partition::postgis::postgis_extract_bbox(key.sk_argument) };
+        } else {
+            label_keys.push(*key);
+        }
+    }
+
+    let query = unsafe {
+        LabeledVector::from_scan_key_data(&label_keys, orderby_keys, &state.meta_page)
+    };
+
+    state.initialize(&indexrel, &heaprel, query, search_list_size, query_bbox);
 }
 
 #[pg_guard]
@@ -398,6 +552,10 @@ pub extern "C-unwind" fn amgettuple(
 
     let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
     match &mut storage {
+        StorageState::SpatialScan(spatial) => {
+            let next = spatial.next();
+            get_tuple(state, next, scan)
+        }
         StorageState::SbqSpeedup(quantizer, iter) => {
             let bq = SbqSpeedupStorage::load_for_search(
                 &indexrel,
@@ -468,6 +626,13 @@ pub extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
 
         let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
         match &mut storage {
+            StorageState::SpatialScan(spatial) => {
+                debug1!(
+                    "Spatial scan stats - returned {} of {} candidates",
+                    spatial.position,
+                    spatial.results.len()
+                );
+            }
             StorageState::SbqSpeedup(_bq, iter) => end_scan::<SbqSpeedupStorage>(iter),
             StorageState::Plain(iter) => end_scan::<PlainStorage>(iter),
         }

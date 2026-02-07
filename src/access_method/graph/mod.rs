@@ -174,13 +174,13 @@ impl<QDM, PD> ListSearchResult<QDM, PD> {
     pub fn consume<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
         &mut self,
         storage: &S,
-    ) -> Option<(HeapPointer, IndexPointer)> {
+    ) -> Option<(HeapPointer, IndexPointer, crate::partition::BBox2D)> {
         if self.visited.is_empty() {
             return None;
         }
         let lsn = self.visited.remove(0);
-        let heap_pointer = storage.return_lsn(&lsn, &mut self.stats);
-        Some((heap_pointer, lsn.index_pointer))
+        let (heap_pointer, bbox) = storage.return_lsn(&lsn, &mut self.stats);
+        Some((heap_pointer, lsn.index_pointer, bbox))
     }
 }
 

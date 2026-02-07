@@ -318,6 +318,23 @@ impl ArchivedSbqNode<'_> {
             ArchivedSbqNode::Labeled(node) => Some(&node.labels),
         }
     }
+
+    pub fn get_bbox(&self) -> BBox2D {
+        match self {
+            ArchivedSbqNode::Classic(node) => BBox2D {
+                xmin: node.bbox.xmin,
+                xmax: node.bbox.xmax,
+                ymin: node.bbox.ymin,
+                ymax: node.bbox.ymax,
+            },
+            ArchivedSbqNode::Labeled(node) => BBox2D {
+                xmin: node.bbox.xmin,
+                xmax: node.bbox.xmax,
+                ymin: node.bbox.ymin,
+                ymax: node.bbox.ymax,
+            },
+        }
+    }
 }
 
 impl ArchivedData for ArchivedMutSbqNode<'_> {

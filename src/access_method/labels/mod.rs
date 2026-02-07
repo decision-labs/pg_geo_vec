@@ -186,10 +186,11 @@ impl LabeledVector {
         let vec = PgVector::from_pg_parts(values, isnull, 0, meta_page, true, false)?;
 
         let labels: Option<LabelSet> = if meta_page.has_labels() {
-            if *isnull.add(1) {
+            let label_idx = meta_page.get_label_attr_idx().unwrap_or(1);
+            if *isnull.add(label_idx) {
                 Some(LabelSet::default())
             } else {
-                let arr = Array::<i16>::from_datum(*values.add(1), false);
+                let arr = Array::<i16>::from_datum(*values.add(label_idx), false);
                 Some(arr.map_or_else(LabelSet::default, |arr| {
                     // Special case to work around apparent bug in pgrx
                     if arr.is_empty() || arr.iter().all(|x| x.is_none()) {

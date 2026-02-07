@@ -85,6 +85,7 @@ impl<'a> PlainStorage<'a> {
 //todo move to storage_common
 pub struct PlainStorageLsnPrivateData {
     pub heap_pointer: HeapPointer,
+    pub bbox: BBox2D,
     pub neighbors: Vec<ItemPointer>,
 }
 
@@ -97,6 +98,12 @@ impl PlainStorageLsnPrivateData {
         stats: &mut PruneNeighborStats,
     ) -> Self {
         let heap_pointer = node.heap_item_pointer.deserialize_item_pointer();
+        let bbox = BBox2D {
+            xmin: node.bbox.xmin,
+            xmax: node.bbox.xmax,
+            ymin: node.bbox.ymin,
+            ymax: node.bbox.ymax,
+        };
         let neighbors = match gns {
             GraphNeighborStore::Disk => node.get_index_pointer_to_neighbors(),
             GraphNeighborStore::Builder(b) => {
@@ -105,6 +112,7 @@ impl PlainStorageLsnPrivateData {
         };
         Self {
             heap_pointer,
+            bbox,
             neighbors,
         }
     }
@@ -305,8 +313,9 @@ impl Storage for PlainStorage<'_> {
         &self,
         lsn: &ListSearchNeighbor<Self::LSNPrivateData>,
         _stats: &mut GreedySearchStats,
-    ) -> HeapPointer {
-        lsn.get_private_data().heap_pointer
+    ) -> (HeapPointer, BBox2D) {
+        let pd = lsn.get_private_data();
+        (pd.heap_pointer, pd.bbox)
     }
 
     fn set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(

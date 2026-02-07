@@ -15,3 +15,6 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Large test data files (download via scripts)
+test_data/kigoto_embeddings.parquet
+

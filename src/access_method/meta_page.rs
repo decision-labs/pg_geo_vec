@@ -15,6 +15,7 @@ use crate::access_method::graph::start_nodes::StartNodes;
 use crate::access_method::node::{ReadableNode, WriteableNode};
 use crate::access_method::options::TSVIndexOptions;
 use crate::access_method::stats::WriteStats;
+use crate::access_method::type_utils::is_geometry_column;
 use crate::util::chain::{ChainItemReader, ChainTapeWriter};
 use crate::util::page::{self, PageType};
 use crate::util::*;
@@ -86,6 +87,9 @@ impl From<&MetaPageV1> for MetaPage {
             start_nodes: Some(start_nodes),
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels: false,
+            has_geometry: false,
+            label_attr_idx: None,
+            spatial_cell_index_start: None,
         }
     }
 }
@@ -157,6 +161,9 @@ impl From<MetaPageV2> for MetaPage {
             start_nodes: Some(start_nodes),
             quantizer_metadata: meta.quantizer_metadata,
             has_labels: false,
+            has_geometry: false,
+            label_attr_idx: None,
+            spatial_cell_index_start: None,
         }
     }
 }
@@ -206,6 +213,12 @@ pub struct MetaPage {
     quantizer_metadata: ItemPointer,
     /// Whether the index has labels
     has_labels: bool,
+    /// Whether the index has a geometry column for spatial filtering
+    has_geometry: bool,
+    /// Zero-based attribute index of the label column (if present)
+    label_attr_idx: Option<u8>,
+    /// Start pointer for the spatial cell index (invalid = no spatial index)
+    spatial_cell_index_start: Option<ItemPointer>,
 }
 
 impl MetaPage {
@@ -255,6 +268,23 @@ impl MetaPage {
 
     pub fn has_labels(&self) -> bool {
         self.has_labels
+    }
+
+    pub fn has_geometry(&self) -> bool {
+        self.has_geometry
+    }
+
+    pub fn get_label_attr_idx(&self) -> Option<usize> {
+        self.label_attr_idx.map(|i| i as usize)
+    }
+
+    pub fn get_spatial_cell_index_start(&self) -> Option<ItemPointer> {
+        self.spatial_cell_index_start
+            .filter(|ip| ip.is_valid())
+    }
+
+    pub fn set_spatial_cell_index_start(&mut self, ip: ItemPointer) {
+        self.spatial_cell_index_start = Some(ip);
     }
 
     pub fn get_start_nodes(&self) -> Option<&StartNodes> {
@@ -332,18 +362,23 @@ impl MetaPage {
             );
         }
 
-        // Check if second column is labels (smallint array).
-        // Geometry detection is handled separately where spatial paths are enabled.
-        let has_labels = if get_num_index_attributes(index) == 2 {
-            if let Some(attr) = index.tuple_desc().get(1) {
-                // Smallint array type OID is 1005 (INT2ARRAYOID)
-                attr.type_oid().value() == pgrx::pg_sys::Oid::from(1005)
-            } else {
-                false
+        // Scan non-vector columns for labels (smallint[]) and geometry.
+        let num_attrs = get_num_index_attributes(index);
+        let mut has_labels = false;
+        let mut has_geometry = false;
+        let mut label_attr_idx: Option<u8> = None;
+        for i in 1..num_attrs {
+            if let Some(attr) = index.tuple_desc().get(i) {
+                let oid = attr.type_oid().value();
+                if oid == pgrx::pg_sys::Oid::from(1005) {
+                    // INT2ARRAYOID = smallint[]
+                    has_labels = true;
+                    label_attr_idx = Some(i as u8);
+                } else if is_geometry_column(index, i) {
+                    has_geometry = true;
+                }
             }
-        } else {
-            false
-        };
+        }
 
         let meta = MetaPage {
             magic_number: TSV_MAGIC_NUMBER,
@@ -360,6 +395,9 @@ impl MetaPage {
             start_nodes: None,
             quantizer_metadata: ItemPointer::new(InvalidBlockNumber, InvalidOffsetNumber),
             has_labels,
+            has_geometry,
+            label_attr_idx,
+            spatial_cell_index_start: None,
         };
 
         meta.store(index, true);
@@ -430,5 +468,16 @@ impl MetaPage {
 
     pub fn set_quantizer_metadata_pointer(&mut self, quantizer_pointer: IndexPointer) {
         self.quantizer_metadata = quantizer_pointer;
+    }
+
+    /// Find the zero-based attribute index of the geometry column in the index, if present.
+    pub fn find_geometry_attr_idx(index: &PgRelation) -> Option<usize> {
+        let num_attrs = get_num_index_attributes(index);
+        for i in 1..num_attrs {
+            if is_geometry_column(index, i) {
+                return Some(i);
+            }
+        }
+        None
     }
 }

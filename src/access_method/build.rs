@@ -16,8 +16,11 @@ use crate::access_method::pg_vector::PgVector;
 use crate::access_method::stats::{InsertStats, WriteStats};
 use crate::util::ports::acquire_index_lock;
 
+use crate::access_method::spatial_index::{SpatialCellIndexBuilder, SpatialGridConfig};
 use crate::access_method::GEO_VEC_DISTANCE_TYPE_PROC;
+use crate::partition::postgis::postgis_extract_bbox;
 use crate::partition::BBox2D;
+use crate::util::chain::ChainTapeWriter;
 use crate::util::page::PageType;
 use crate::util::ports::IndexBuildHeapScanParallel;
 use crate::util::tape::Tape;
@@ -63,6 +66,8 @@ struct BuildState<'a> {
     tape: Tape<'a>, //The tape is a memory abstraction over Postgres pages for writing data.
     graph: Graph<'a>,
     stats: InsertStats,
+    geom_attr_idx: Option<usize>,
+    spatial_entries: Vec<(ItemPointer, BBox2D)>,
 }
 
 /// Wrapper for BuildState that shares statistics with parallel workers
@@ -74,10 +79,16 @@ struct BuildStateParallel<'a> {
     local_stats: InsertStats,
     local_ntuples: usize,
     is_initializing_worker: bool,
+    geom_attr_idx: Option<usize>,
 }
 
 impl<'a> BuildState<'a> {
-    fn new(index_relation: &'a PgRelation, graph: Graph<'a>, page_type: PageType) -> Self {
+    fn new(
+        index_relation: &'a PgRelation,
+        graph: Graph<'a>,
+        page_type: PageType,
+        geom_attr_idx: Option<usize>,
+    ) -> Self {
         let tape = unsafe { Tape::new(index_relation, page_type) };
 
         BuildState {
@@ -86,6 +97,8 @@ impl<'a> BuildState<'a> {
             tape,
             graph,
             stats: InsertStats::default(),
+            geom_attr_idx,
+            spatial_entries: Vec::new(),
         }
     }
 }
@@ -97,6 +110,7 @@ impl<'a> BuildStateParallel<'a> {
         page_type: PageType,
         shared_state: &'a ParallelShared,
         is_initializing_worker: bool,
+        geom_attr_idx: Option<usize>,
     ) -> Self {
         let tape = unsafe { Tape::new(index_relation, page_type) };
 
@@ -108,6 +122,7 @@ impl<'a> BuildStateParallel<'a> {
             local_stats: InsertStats::default(),
             local_ntuples: 0,
             is_initializing_worker,
+            geom_attr_idx,
         }
     }
 
@@ -163,6 +178,8 @@ impl<'a> BuildStateParallel<'a> {
             tape: self.tape,
             graph: self.graph,
             stats: self.local_stats,
+            geom_attr_idx: self.geom_attr_idx,
+            spatial_entries: Vec::new(),
         }
     }
 
@@ -244,6 +261,21 @@ struct ParallelBuildInfo {
     parallel_shared: *mut ParallelShared,
     is_initializing_worker: bool,
     tablescandesc: *mut pg_sys::ParallelTableScanDescData,
+}
+
+/// Extract bbox from values array using the geometry column index.
+/// Returns BBox2D::empty() if no geometry column or extraction fails.
+unsafe fn extract_bbox_from_values(
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    geom_attr_idx: Option<usize>,
+) -> BBox2D {
+    match geom_attr_idx {
+        Some(idx) if !*isnull.add(idx) => {
+            postgis_extract_bbox(*values.add(idx)).unwrap_or(BBox2D::empty())
+        }
+        _ => BBox2D::empty(),
+    }
 }
 
 fn get_meta_page(
@@ -499,6 +531,9 @@ unsafe fn aminsert_internal(
     }
     let vec = vec.unwrap();
 
+    let geom_attr_idx = MetaPage::find_geometry_attr_idx(&index_relation);
+    let bbox = extract_bbox_from_values(values, isnull, geom_attr_idx);
+
     let heap_pointer = ItemPointer::with_item_pointer_data(*heap_tid);
     let mut storage = meta_page.get_storage_type();
     let mut stats = InsertStats::default();
@@ -511,6 +546,7 @@ unsafe fn aminsert_internal(
                 &plain,
                 &index_relation,
                 vec,
+                bbox,
                 heap_pointer,
                 &mut meta_page,
                 &mut stats,
@@ -527,6 +563,7 @@ unsafe fn aminsert_internal(
                 &bq,
                 &index_relation,
                 vec,
+                bbox,
                 heap_pointer,
                 &mut meta_page,
                 &mut stats,
@@ -540,6 +577,7 @@ unsafe fn insert_storage<S: Storage>(
     storage: &S,
     index_relation: &PgRelation,
     vector: LabeledVector,
+    bbox: BBox2D,
     heap_pointer: ItemPointer,
     meta_page: &mut MetaPage,
     stats: &mut InsertStats,
@@ -548,7 +586,7 @@ unsafe fn insert_storage<S: Storage>(
 
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
-        BBox2D::empty(),
+        bbox,
         vector.labels().cloned(),
         heap_pointer,
         meta_page,
@@ -731,6 +769,9 @@ fn do_heap_scan(
         pgstat_progress_update_param(PROGRESS_CREATE_IDX_SUBPHASE, BUILD_PHASE_BUILDING_GRAPH);
     }
 
+    // Detect geometry column index for bbox extraction during build
+    let geom_attr_idx = MetaPage::find_geometry_attr_idx(index_relation);
+
     let storage = meta_page.get_storage_type();
 
     if let Some(parallel_info) = parallel_build_info {
@@ -762,6 +803,7 @@ fn do_heap_scan(
                     page_type,
                     shared_state,
                     parallel_info.is_initializing_worker,
+                    geom_attr_idx,
                 );
                 let mut state = StorageBuildStateParallel::Plain(&mut plain, &mut bs);
 
@@ -797,6 +839,7 @@ fn do_heap_scan(
                     page_type,
                     shared_state,
                     parallel_info.is_initializing_worker,
+                    geom_attr_idx,
                 );
                 let mut state = StorageBuildStateParallel::SbqSpeedup(&mut bq, &mut bs);
 
@@ -842,7 +885,7 @@ fn do_heap_scan(
                     graph.get_meta_page(),
                 );
                 let page_type = PlainStorage::page_type();
-                let mut bs = BuildState::new(index_relation, graph, page_type);
+                let mut bs = BuildState::new(index_relation, graph, page_type, geom_attr_idx);
                 let mut state = StorageBuildState::Plain(&mut plain, &mut bs);
 
                 unsafe {
@@ -868,7 +911,7 @@ fn do_heap_scan(
                 };
 
                 let page_type = SbqSpeedupStorage::page_type();
-                let mut bs = BuildState::new(index_relation, graph, page_type);
+                let mut bs = BuildState::new(index_relation, graph, page_type, geom_attr_idx);
                 let mut state = StorageBuildState::SbqSpeedup(&mut bq, &mut bs);
 
                 unsafe {
@@ -911,7 +954,12 @@ fn finalize_index_build<S: Storage>(
     index_relation: &PgRelation,
     mut write_stats: WriteStats,
 ) -> usize {
-    let BuildState { graph, ntuples, .. } = state;
+    let BuildState {
+        graph,
+        ntuples,
+        spatial_entries,
+        ..
+    } = state;
     let (neighbor_store, meta_page) = graph.into_parts();
     let cache_entries = neighbor_store.into_sorted();
 
@@ -939,6 +987,35 @@ fn finalize_index_build<S: Storage>(
             &mut write_stats,
         );
     }
+
+    // Build and write spatial cell index if we have geometry entries
+    if !spatial_entries.is_empty() {
+        // Compute extent from all entries
+        let mut extent = BBox2D::empty();
+        for (_, bbox) in &spatial_entries {
+            extent = extent.union(bbox);
+        }
+
+        let grid = SpatialGridConfig::from_extent(extent, spatial_entries.len());
+        let mut builder = SpatialCellIndexBuilder::new(grid);
+        for (ip, bbox) in &spatial_entries {
+            builder.add(*ip, bbox);
+        }
+        let cell_index = builder.build();
+
+        let bytes = cell_index.serialize_to_bytes();
+        let mut tape =
+            ChainTapeWriter::new(index_relation, PageType::SpatialCellIndex, &mut write_stats);
+        let start_ip = tape.write(&bytes);
+        meta_page.set_spatial_cell_index_start(start_ip);
+
+        notice!(
+            "Built spatial cell index: {} cells, {} entries",
+            cell_index.grid.num_cells(),
+            cell_index.node_pointers.len()
+        );
+    }
+
     unsafe {
         meta_page.store(index_relation, false);
     }
@@ -995,13 +1072,15 @@ unsafe extern "C-unwind" fn build_callback(
         StorageBuildState::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *bq);
+                let bbox = extract_bbox_from_values(values, isnull, state.geom_attr_idx);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, bbox, state, *bq);
             }
         }
         StorageBuildState::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
-                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, state, *plain);
+                let bbox = extract_bbox_from_values(values, isnull, state.geom_attr_idx);
+                build_callback_memory_wrapper(&index_relation, heap_pointer, vec, bbox, state, *plain);
             }
         }
     }
@@ -1024,10 +1103,12 @@ unsafe extern "C-unwind" fn build_callback_parallel(
         StorageBuildStateParallel::SbqSpeedup(bq, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
+                let bbox = extract_bbox_from_values(values, isnull, state.geom_attr_idx);
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
+                    bbox,
                     state,
                     *bq,
                 );
@@ -1036,10 +1117,12 @@ unsafe extern "C-unwind" fn build_callback_parallel(
         StorageBuildStateParallel::Plain(plain, state) => {
             let vec = LabeledVector::from_datums(values, isnull, state.graph.get_meta_page());
             if let Some(vec) = vec {
+                let bbox = extract_bbox_from_values(values, isnull, state.geom_attr_idx);
                 build_callback_parallel_memory_wrapper(
                     &index_relation,
                     heap_pointer,
                     vec,
+                    bbox,
                     state,
                     *plain,
                 );
@@ -1053,12 +1136,13 @@ unsafe fn build_callback_memory_wrapper<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
+    bbox: BBox2D,
     state: &mut BuildState,
     storage: &mut S,
 ) {
     let mut old_context = state.memcxt.set_as_current();
 
-    build_callback_internal(index, heap_pointer, vector, state, storage);
+    build_callback_internal(index, heap_pointer, vector, bbox, state, storage);
 
     old_context.set_as_current();
     state.memcxt.reset();
@@ -1069,6 +1153,7 @@ fn build_callback_internal<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
+    bbox: BBox2D,
     state: &mut BuildState,
     storage: &mut S,
 ) {
@@ -1078,7 +1163,7 @@ fn build_callback_internal<S: Storage>(
 
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
-        BBox2D::empty(),
+        bbox,
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),
@@ -1089,6 +1174,11 @@ fn build_callback_internal<S: Storage>(
     state
         .graph
         .insert(index, index_pointer, vector, storage, &mut state.stats);
+
+    // Accumulate spatial entries for cell index (only non-empty bboxes)
+    if !bbox.is_empty() {
+        state.spatial_entries.push((index_pointer, bbox));
+    }
 }
 
 #[inline(always)]
@@ -1096,12 +1186,13 @@ unsafe fn build_callback_parallel_memory_wrapper<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
+    bbox: BBox2D,
     state: &mut BuildStateParallel,
     storage: &mut S,
 ) {
     let mut old_context = state.memcxt.set_as_current();
 
-    build_callback_parallel_internal(index, heap_pointer, vector, state, storage);
+    build_callback_parallel_internal(index, heap_pointer, vector, bbox, state, storage);
 
     old_context.set_as_current();
     state.memcxt.reset();
@@ -1112,6 +1203,7 @@ fn build_callback_parallel_internal<S: Storage>(
     index: &PgRelation,
     heap_pointer: ItemPointer,
     vector: LabeledVector,
+    bbox: BBox2D,
     state: &mut BuildStateParallel,
     storage: &mut S,
 ) {
@@ -1122,7 +1214,7 @@ fn build_callback_parallel_internal<S: Storage>(
     // Create node using local tape - PostgreSQL page locking handles concurrency
     let index_pointer = storage.create_node(
         vector.vec().to_index_slice(),
-        BBox2D::empty(),
+        bbox,
         vector.labels().cloned(),
         heap_pointer,
         state.graph.get_meta_page(),

@@ -407,12 +407,12 @@ impl Storage for SbqSpeedupStorage<'_> {
         &self,
         lsn: &ListSearchNeighbor<Self::LSNPrivateData>,
         stats: &mut GreedySearchStats,
-    ) -> HeapPointer {
+    ) -> (HeapPointer, BBox2D) {
         let lsn_index_pointer = lsn.index_pointer;
         let rn = unsafe { SbqNode::read(self.index, lsn_index_pointer, self.has_labels, stats) };
         let node = rn.get_archived_node();
 
-        node.get_heap_item_pointer()
+        (node.get_heap_item_pointer(), node.get_bbox())
     }
 
     fn set_neighbors_on_disk<S: StatsNodeModify + StatsNodeRead>(

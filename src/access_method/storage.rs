@@ -113,7 +113,7 @@ pub trait Storage {
         &self,
         lsn: &ListSearchNeighbor<Self::LSNPrivateData>,
         stats: &mut GreedySearchStats,
-    ) -> HeapPointer
+    ) -> (HeapPointer, BBox2D)
     where
         Self: Sized;
 

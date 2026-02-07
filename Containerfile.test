@@ -14,7 +14,12 @@ RUN apt-get update && apt-get install -y \
     postgresql-17-pgvector \
     clang \
     llvm \
+    python3-pip \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies for test data loading
+RUN pip3 install --break-system-packages pyarrow psycopg2-binary
 
 # Install Rust
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
