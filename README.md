@@ -44,7 +44,13 @@ CREATE EXTENSION vector;
 CREATE EXTENSION geo_vec;
 
 -- Create a composite index (vector + spatial)
-CREATE INDEX ON places USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops);
+CREATE INDEX ON places USING geo_vec (embedding vector_cosine_ops, geom);
+
+-- Or with label filtering
+CREATE INDEX ON places USING geo_vec (embedding vector_cosine_ops, labels);
+
+-- All three: vector + spatial + labels
+CREATE INDEX ON places USING geo_vec (embedding vector_cosine_ops, geom, labels);
 
 -- Query: spatial filter + vector ANN in one index scan
 SELECT id, embedding <=> query_vec AS dist
@@ -96,7 +102,7 @@ CREATE EXTENSION geo_vec;      -- access method: geo_vec
 CREATE EXTENSION vectorscale;  -- access method: diskann
 
 -- Both work on the same table
-CREATE INDEX idx_geovec ON places USING geo_vec (embedding vector_cosine_ops, geom geometry_geo_vec_ops);
+CREATE INDEX idx_geovec ON places USING geo_vec (embedding vector_cosine_ops, geom);
 CREATE INDEX idx_diskann ON places USING diskann (embedding vector_cosine_ops);
 ```
 
