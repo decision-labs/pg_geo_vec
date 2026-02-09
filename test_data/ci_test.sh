@@ -4,9 +4,20 @@ set -euo pipefail
 
 cd /workspace
 
+# ---------- Detect architecture for SIMD flags ----------
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    export RUSTFLAGS="-C target-feature=+avx2,+fma"
+elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$(sw_vers -productVersion 2>/dev/null || echo '')}"
+    export RUSTFLAGS="-C target-feature=+neon -C link-arg=-Wl,-undefined,dynamic_lookup"
+else
+    echo "WARNING: Unknown architecture $ARCH, building without SIMD flags"
+fi
+
 # ---------- Build extension ----------
-echo ">>> Building geo_vec extension (release)..."
-RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17 2>&1
+echo ">>> Building geo_vec extension (release) for $ARCH..."
+cargo pgrx install --release --no-default-features --features pg17 2>&1
 
 echo ""
 echo ">>> Installed files:"

@@ -5,7 +5,7 @@
 - PostgreSQL 17+
 - PostGIS 3.x
 - pgvector 0.7+
-- Rust stable toolchain (with AVX2+FMA CPU support)
+- Rust stable toolchain (x86_64 with AVX2+FMA, or aarch64/Apple Silicon with NEON)
 - cargo-pgrx 0.16.1
 
 ## Installation
@@ -21,7 +21,14 @@ cargo pgrx init --pg17=/usr/bin/pg_config
 
 ```bash
 cd pg_geo_vec
+
+# x86_64 (Linux)
 RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17
+
+# aarch64 / Apple Silicon (macOS)
+MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion) \
+RUSTFLAGS="-C target-feature=+neon -C link-arg=-Wl,-undefined,dynamic_lookup" \
+cargo pgrx install --release --no-default-features --features pg17
 ```
 
 ### 3. Create extensions

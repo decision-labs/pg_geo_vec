@@ -20,7 +20,7 @@ Built on the DiskANN graph algorithm (forked from [pgvectorscale](https://github
 - PostgreSQL 17+
 - [PostGIS](https://postgis.net/)
 - [pgvector](https://github.com/pgvector/pgvector) (for the `vector` type)
-- Rust toolchain with AVX2+FMA support
+- Rust toolchain (x86_64 with AVX2+FMA, or aarch64/Apple Silicon with NEON)
 - [cargo-pgrx](https://github.com/pgcentralfoundation/pgrx) 0.16.1
 
 ## Quick Start
@@ -28,7 +28,14 @@ Built on the DiskANN graph algorithm (forked from [pgvectorscale](https://github
 ```bash
 # Build and install
 cargo pgrx init --pg17=/usr/bin/pg_config
+
+# x86_64 (Linux)
 RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17
+
+# aarch64 / Apple Silicon (macOS)
+MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion) \
+RUSTFLAGS="-C target-feature=+neon -C link-arg=-Wl,-undefined,dynamic_lookup" \
+cargo pgrx install --release --no-default-features --features pg17
 ```
 
 ```sql
@@ -101,11 +108,18 @@ CREATE INDEX idx_diskann ON places USING diskann (embedding vector_cosine_ops);
 ## Development
 
 ```bash
+# Set RUSTFLAGS for your architecture
+# x86_64 (Linux):
+export RUSTFLAGS="-C target-feature=+avx2,+fma"
+# aarch64 / Apple Silicon (macOS):
+export MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion)
+export RUSTFLAGS="-C target-feature=+neon -C link-arg=-Wl,-undefined,dynamic_lookup"
+
 # Build (debug)
-RUSTFLAGS="-C target-feature=+avx2,+fma" cargo build --no-default-features --features pg17
+cargo build --no-default-features --features pg17
 
 # Build (release)
-RUSTFLAGS="-C target-feature=+avx2,+fma" cargo pgrx install --release --no-default-features --features pg17
+cargo pgrx install --release --no-default-features --features pg17
 
 # Integration tests (requires podman/docker)
 podman build -t geo_vec_test -f Containerfile.test .

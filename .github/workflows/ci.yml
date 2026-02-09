@@ -26,8 +26,17 @@ on:
 
 jobs:
   build:
-    name: Build
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            rustflags: "-C target-feature=+avx2,+fma"
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            rustflags: "-C target-feature=+neon"
     container:
       image: docker.io/postgres:17
       options: --user root
@@ -54,8 +63,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-cargo-
 
       - name: Install cargo-pgrx
         run: |
@@ -70,12 +79,19 @@ jobs:
       - name: Build extension
         run: |
           . $HOME/.cargo/env
-          RUSTFLAGS="-C target-feature=+avx2,+fma" cargo build --no-default-features --features pg17
+          RUSTFLAGS="${{ matrix.rustflags }}" cargo build --no-default-features --features pg17
 
   integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
+    name: Integration Tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     needs: build
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
