@@ -62,6 +62,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_plain_storage_vacuum_index_bloat() {
+        crate::access_method::vacuum::tests::test_vacuum_index_bloat_scaffold(
+            "num_neighbors = 20, storage_layout = plain",
+        );
+    }
+
+    #[test]
+    fn test_plain_storage_vacuum_recall_after_churn() {
+        crate::access_method::vacuum::tests::test_vacuum_recall_after_churn_scaffold(
+            "num_neighbors = 20, storage_layout = plain",
+        );
+    }
+
     #[pg_test]
     unsafe fn test_plain_storage_empty_table_insert() -> spi::Result<()> {
         crate::access_method::build::tests::test_empty_table_insert_scaffold(

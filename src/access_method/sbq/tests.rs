@@ -59,6 +59,20 @@ mod tests {
             "num_neighbors = 38, storage_layout = memory_optimized",
         );
     }
+
+    #[test]
+    fn test_bq_compressed_storage_vacuum_index_bloat() {
+        crate::access_method::vacuum::tests::test_vacuum_index_bloat_scaffold(
+            "num_neighbors = 20, storage_layout = memory_optimized",
+        );
+    }
+
+    #[test]
+    fn test_bq_compressed_storage_vacuum_recall_after_churn() {
+        crate::access_method::vacuum::tests::test_vacuum_recall_after_churn_scaffold(
+            "num_neighbors = 20, storage_layout = memory_optimized",
+        );
+    }
     #[pg_test]
     unsafe fn test_bq_compressed_storage_empty_table_insert() -> spi::Result<()> {
         crate::access_method::build::tests::test_empty_table_insert_scaffold(

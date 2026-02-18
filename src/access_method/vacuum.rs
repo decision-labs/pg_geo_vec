@@ -457,6 +457,221 @@ pub mod tests {
             .unwrap();
     }
 
+    #[cfg(test)]
+    static VAC_BLOAT_MUTEX: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+        once_cell::sync::Lazy::new(std::sync::Mutex::default);
+
+    /// Test that VACUUM does not reclaim index pages (current limitation)
+    /// and that REINDEX shrinks the index back down.
+    #[cfg(test)]
+    pub fn test_vacuum_index_bloat_scaffold(index_options: &str) {
+        let _lock = VAC_BLOAT_MUTEX.lock().unwrap();
+        let dims = 64usize;
+        let n = 200i64;
+        let ones = vec!["1.0"; dims].join(",");
+
+        pgrx_tests::run_test(
+            "test_delete_mock_fn",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+
+        let (mut client, _) = pgrx_tests::client().unwrap();
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE test_bloat(id INT GENERATED ALWAYS AS IDENTITY, embedding vector({dims}));
+                 SELECT setseed(0.5);
+                 INSERT INTO test_bloat (embedding)
+                 SELECT ('['||array_to_string(array_agg(random()),',','0')||']')::vector
+                 FROM generate_series(1, {dims} * {n}) i GROUP BY i % {n};
+                 CREATE INDEX idx_bloat ON test_bloat USING geo_vec(embedding) WITH ({index_options});"
+            ))
+            .unwrap();
+
+        let size_before: i64 = client
+            .query_one("SELECT pg_relation_size('idx_bloat')", &[])
+            .unwrap()
+            .get(0);
+
+        client.execute("SET enable_seqscan = 0;", &[]).unwrap();
+        let cnt: i64 = client
+            .query_one(
+                &format!("WITH cte AS (SELECT * FROM test_bloat ORDER BY embedding <=> '[{ones}]') SELECT count(*) FROM cte;"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(cnt, n, "initial count");
+
+        client
+            .execute(&format!("DELETE FROM test_bloat WHERE id <= {}", n / 2), &[])
+            .unwrap();
+
+        client.close().unwrap();
+        let (mut client, _) = pgrx_tests::client().unwrap();
+
+        client.execute("VACUUM test_bloat", &[]).unwrap();
+
+        let size_after_vacuum: i64 = client
+            .query_one("SELECT pg_relation_size('idx_bloat')", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            size_after_vacuum, size_before,
+            "VACUUM should NOT reclaim index pages (current behavior)"
+        );
+
+        client.execute("SET enable_seqscan = 0;", &[]).unwrap();
+        let cnt: i64 = client
+            .query_one(
+                &format!("WITH cte AS (SELECT * FROM test_bloat ORDER BY embedding <=> '[{ones}]') SELECT count(*) FROM cte;"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(cnt, n / 2, "count after vacuum");
+
+        client.execute("REINDEX INDEX idx_bloat", &[]).unwrap();
+
+        let size_after_reindex: i64 = client
+            .query_one("SELECT pg_relation_size('idx_bloat')", &[])
+            .unwrap()
+            .get(0);
+        assert!(
+            size_after_reindex < size_before,
+            "REINDEX should shrink the index: before={size_before} after={size_after_reindex}"
+        );
+
+        client.execute("SET enable_seqscan = 0;", &[]).unwrap();
+        let cnt: i64 = client
+            .query_one(
+                &format!("WITH cte AS (SELECT * FROM test_bloat ORDER BY embedding <=> '[{ones}]') SELECT count(*) FROM cte;"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(cnt, n / 2, "count after reindex");
+
+        client.execute("DROP TABLE test_bloat", &[]).unwrap();
+    }
+
+    /// Test that recall degrades after delete/insert churn with only VACUUM,
+    /// and that REINDEX restores it.
+    #[cfg(test)]
+    pub fn test_vacuum_recall_after_churn_scaffold(index_options: &str) {
+        let _lock = VAC_BLOAT_MUTEX.lock().unwrap();
+        let dims = 64usize;
+        let n: i64 = 300;
+        let k: i64 = 10;
+        let ones = vec!["1.0"; dims].join(",");
+        let query_vec = format!("[{ones}]");
+
+        pgrx_tests::run_test(
+            "test_delete_mock_fn",
+            None,
+            crate::pg_test::postgresql_conf_options(),
+        )
+        .unwrap();
+
+        let (mut client, _) = pgrx_tests::client().unwrap();
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE test_recall(id INT GENERATED ALWAYS AS IDENTITY, embedding vector({dims}));
+                 SELECT setseed(0.42);
+                 INSERT INTO test_recall (embedding)
+                 SELECT ('['||array_to_string(array_agg(random()),',','0')||']')::vector
+                 FROM generate_series(1, {dims} * {n}) i GROUP BY i % {n};
+                 CREATE INDEX idx_recall ON test_recall USING geo_vec(embedding) WITH ({index_options});"
+            ))
+            .unwrap();
+
+        // Churn: delete a chunk, insert replacements, vacuum (repeat 3x)
+        for round in 0..3i64 {
+            let lo = round * (n / 6) + 1;
+            let hi = lo + n / 6 - 1;
+            client
+                .execute(&format!("DELETE FROM test_recall WHERE id BETWEEN {lo} AND {hi}"), &[])
+                .unwrap();
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO test_recall (embedding)
+                         SELECT ('['||array_to_string(array_agg(random()),',','0')||']')::vector
+                         FROM generate_series(1, {dims} * {}) i GROUP BY i % {}", n / 6, n / 6
+                    ),
+                    &[],
+                )
+                .unwrap();
+
+            client.close().unwrap();
+            let (c, _) = pgrx_tests::client().unwrap();
+            client = c;
+            client.execute("VACUUM test_recall", &[]).unwrap();
+        }
+
+        // Ground truth after churn: exact top-k via sequential scan
+        let ground_truth: Vec<i32> = client
+            .query(
+                &format!(
+                    "SET enable_indexscan = 0; SET enable_seqscan = 1;
+                     SELECT id FROM test_recall ORDER BY embedding <=> '{query_vec}' LIMIT {k};"
+                ),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+
+        // Recall via index scan (before REINDEX)
+        client.execute("SET enable_seqscan = 0;", &[]).unwrap();
+        let index_results: Vec<i32> = client
+            .query(
+                &format!(
+                    "SELECT id FROM test_recall ORDER BY embedding <=> '{query_vec}' LIMIT {k};"
+                ),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+
+        let recall_before = ground_truth.iter().filter(|id| index_results.contains(id)).count();
+
+        // REINDEX rebuilds the graph cleanly
+        client.execute("REINDEX INDEX idx_recall", &[]).unwrap();
+
+        client.execute("SET enable_seqscan = 0;", &[]).unwrap();
+        let reindexed_results: Vec<i32> = client
+            .query(
+                &format!(
+                    "SELECT id FROM test_recall ORDER BY embedding <=> '{query_vec}' LIMIT {k};"
+                ),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+
+        let recall_after = ground_truth.iter().filter(|id| reindexed_results.contains(id)).count();
+
+        assert!(
+            recall_after >= k as usize - 1,
+            "REINDEX should restore recall: got {recall_after}/{k}"
+        );
+
+        eprintln!(
+            "recall before reindex: {recall_before}/{k}, after reindex: {recall_after}/{k}"
+        );
+
+        client.execute("DROP TABLE test_recall", &[]).unwrap();
+    }
+
     #[pg_test]
     ///This function is only a mock to bring up the test framewokr in test_delete_vacuum
     fn test_delete_mock_fn() -> spi::Result<()> {

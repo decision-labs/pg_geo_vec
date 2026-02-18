@@ -3,4 +3,4 @@ default_version = '@CARGO_VERSION@'
 module_pathname = '$libdir/geo_vec'
 relocatable = false
 superuser = true
-requires = 'postgis'
+requires = 'vector, postgis'
