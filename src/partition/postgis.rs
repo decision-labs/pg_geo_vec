@@ -195,6 +195,10 @@ unsafe fn extract_bbox_from_gserialized(
 unsafe fn postgis_extract_bbox_fallback(geom_datum: pg_sys::Datum) -> Option<super::BBox2D> {
     let lwgeom_to_box2df = resolve_lwgeom_to_box2df()?;
     let box2df_datum =
+        // This calls a Postgres C function pointer for LWGEOM_to_BOX2DF, passing the geometry datum.
+        // DirectFunctionCall1Coll is a Postgres utility for invoking a function pointer (possibly dynamically loaded)
+        // with a single argument (geom_datum), without any collation (InvalidOid).
+        // It returns a Datum representing the result (BOX2DF*), or a null Datum if the function returns NULL.
         pg_sys::DirectFunctionCall1Coll(Some(lwgeom_to_box2df), pg_sys::InvalidOid, geom_datum);
     if box2df_datum.is_null() {
         return None;

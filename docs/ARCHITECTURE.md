@@ -132,7 +132,7 @@ Heap Scan  ─── for each row ───────────────�
     │                                                       │
     │  Extract vector ──── LabeledVector::from_datums()     │
     │  Extract bbox   ──── postgis_extract_bbox(geom)       │
-    │  Extract labels ──── parse smallint[]                  │
+    │  Extract labels ──── parse smallint[]                 │
     │                                                       │
     │  Storage::create_node(vector, bbox, labels, heap_ptr) │
     │      → Write PlainNode or SbqNode to Tape page        │

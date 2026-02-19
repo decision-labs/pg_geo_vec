@@ -86,6 +86,13 @@ impl SpatialGridConfig {
 
     /// Find all cell indices that overlap with the given bbox.
     pub fn bbox_to_cells(&self, bbox: &BBox2D) -> Vec<usize> {
+        self.bbox_to_cells_with_margin(bbox, 0)
+    }
+
+    /// Find all cell indices that overlap with the given bbox, expanded by
+    /// `margin` cells in each direction. This accounts for nodes whose centroids
+    /// are in adjacent cells but whose actual geometry overlaps the query bbox.
+    pub fn bbox_to_cells_with_margin(&self, bbox: &BBox2D, margin: u32) -> Vec<usize> {
         let width = (self.xmax - self.xmin).max(f32::MIN_POSITIVE);
         let height = (self.ymax - self.ymin).max(f32::MIN_POSITIVE);
 
@@ -101,6 +108,11 @@ impl SpatialGridConfig {
         let max_row = ((bbox.ymax - self.ymin) / height * self.rows as f32)
             .floor()
             .clamp(0.0, (self.rows - 1) as f32) as u32;
+
+        let min_col = min_col.saturating_sub(margin);
+        let max_col = (max_col + margin).min(self.cols - 1);
+        let min_row = min_row.saturating_sub(margin);
+        let max_row = (max_row + margin).min(self.rows - 1);
 
         let mut cells = Vec::new();
         for row in min_row..=max_row {
@@ -129,8 +141,11 @@ pub struct SpatialCellIndex {
 
 impl SpatialCellIndex {
     /// Return all node pointers whose cells overlap the query bbox.
+    /// Uses a 1-cell margin to capture nodes whose centroids are in adjacent
+    /// cells but whose actual bboxes overlap the query; callers apply an exact
+    /// bbox filter to remove false positives.
     pub fn nodes_in_bbox(&self, query_bbox: &BBox2D) -> Vec<ItemPointer> {
-        let cells = self.grid.bbox_to_cells(query_bbox);
+        let cells = self.grid.bbox_to_cells_with_margin(query_bbox, 1);
         let mut result = Vec::new();
         for cell_idx in cells {
             let start = self.cell_offsets[cell_idx] as usize;
@@ -145,12 +160,13 @@ impl SpatialCellIndex {
     /// Returns `(seeds, total_candidate_count)` where `total_candidate_count` is the
     /// total number of nodes in overlapping cells (used for threshold decisions).
     /// Seeds are evenly-spaced samples from each cell (up to `max_per_cell` per cell).
+    /// Uses a 1-cell margin to capture edge-case nodes near cell boundaries.
     pub fn sample_seeds_in_bbox(
         &self,
         query_bbox: &BBox2D,
         max_per_cell: usize,
     ) -> (Vec<ItemPointer>, usize) {
-        let cells = self.grid.bbox_to_cells(query_bbox);
+        let cells = self.grid.bbox_to_cells_with_margin(query_bbox, 1);
         let mut seeds = Vec::new();
         let mut total_count: usize = 0;
 

@@ -31,4 +31,10 @@ RUN cargo install cargo-pgrx --version 0.16.1 --locked
 # Initialize pgrx with the system PostgreSQL
 RUN cargo pgrx init --pg17=/usr/bin/pg_config
 
+# Build and install pgvectorscale (DiskANN)
+RUN git clone --branch 0.9.0 --depth 1 https://github.com/timescale/pgvectorscale.git /tmp/pgvectorscale \
+    && cd /tmp/pgvectorscale/pgvectorscale \
+    && cargo pgrx install --release --no-default-features --features pg17 \
+    && rm -rf /tmp/pgvectorscale
+
 WORKDIR /workspace

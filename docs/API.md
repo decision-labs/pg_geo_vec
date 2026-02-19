@@ -220,3 +220,27 @@ CREATE EXTENSION vectorscale;  -- registers access method: diskann
 All geo_vec SQL functions are prefixed with `geo_vec_` to avoid name collisions with pgvectorscale's `distance_type_cosine()`, `smallint_array_overlap()`, etc.
 
 Operator classes (`vector_cosine_ops`, etc.) share names but are scoped per access method — `USING geo_vec` vs `USING diskann` — so they don't conflict.
+
+## Coexistence with PostGIS GiST
+
+PostGIS registers the `&&` (bounding box overlap) operator for geometry in the **GiST** access method (`gist_geometry_ops_2d`, strategy 3). geo_vec registers the same `&&` operator for geometry in the **geo_vec** access method (`geometry_geo_vec_ops`, strategy 6).
+
+They don't conflict because PostgreSQL's operator class system is **scoped per access method**. The planner picks which index to use based on what the query needs:
+
+```sql
+-- Both indexes on the same table
+CREATE INDEX buildings_gist_idx ON buildings USING gist (geom);
+CREATE INDEX buildings_geo_vec_idx ON buildings USING geo_vec (embedding vector_cosine_ops, geom);
+
+-- Pure spatial query → planner picks GiST (PostGIS)
+SELECT id FROM buildings
+WHERE geom && ST_MakeEnvelope(-117.598, 47.651, -117.586, 47.655, 4326);
+
+-- Spatial + vector query → planner picks geo_vec (single index scan)
+SELECT id FROM buildings
+WHERE geom && ST_MakeEnvelope(-117.598, 47.651, -117.586, 47.655, 4326)
+ORDER BY embedding <=> query_vec
+LIMIT 20;
+```
+
+The `&&` operator is the same PostGIS function in both cases — the routing is determined by which access method's operator class claims it in `pg_amop`.

@@ -7,7 +7,7 @@ import psycopg2
 import pyarrow.parquet as pq
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "postgres"
-HOST = sys.argv[2] if len(sys.argv) > 2 else "/var/run/postgresql"
+HOST = sys.argv[2] if len(sys.argv) > 2 else "localhost"
 
 conn = psycopg2.connect(dbname=DB, host=HOST)
 conn.autocommit = True
@@ -17,6 +17,7 @@ cur = conn.cursor()
 cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 cur.execute('CREATE EXTENSION IF NOT EXISTS geo_vec;')
+cur.execute('CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE;')
 
 # Create table
 cur.execute("DROP TABLE IF EXISTS buildings CASCADE;")
@@ -29,7 +30,7 @@ cur.execute("""
 """)
 
 # Load parquet
-t = pq.read_table("/workspace/test_data/building_detection_embeddings.parquet")
+t = pq.read_table("test_data/building_detection_embeddings.parquet")
 embeddings = t.column("embedding")
 geometries = t.column("geometry")
 
