@@ -6,44 +6,28 @@
 
 It is a fork of [pgvectorscale](https://github.com/timescale/pgvectorscale), adding the spatial cell index, label filtering, and three-way query routing.
 
-```
-                        ┌─────────────────────────┐
-                        │      SQL Query           │
-                        │  ORDER BY emb <=> q      │
-                        │  WHERE geom && bbox      │
-                        │    AND labels && '{2}'    │
-                        └────────────┬────────────┘
-                                     │
-                        ┌────────────▼────────────┐
-                        │   PostgreSQL Executor    │
-                        │   (Index Scan node)      │
-                        └────────────┬────────────┘
-                                     │
-                ┌────────────────────▼────────────────────┐
-                │          geo_vec Access Method           │
-                │         (amhandler / scan.rs)            │
-                ├─────────────────────────────────────────┤
-                │                                         │
-                │  ┌──────────┐ ┌────────┐ ┌───────────┐ │
-                │  │  Graph   │ │Spatial │ │  Label    │ │
-                │  │ (DiskANN)│ │Cell Idx│ │ Filter    │ │
-                │  └─────┬────┘ └───┬────┘ └─────┬─────┘ │
-                │        │          │             │       │
-                │  ┌─────▼──────────▼─────────────▼─────┐ │
-                │  │       Storage Layer                │ │
-                │  │   Plain (f32)  |  SBQ (1-2 bit)    │ │
-                │  └────────────────────────────────────┘ │
-                │                                         │
-                │  ┌────────────────────────────────────┐ │
-                │  │   Page / Buffer Utilities          │ │
-                │  │   Tape, ChainTape, LRU cache       │ │
-                │  └────────────────────────────────────┘ │
-                └──────────────────┬──────────────────────┘
-                                   │
-                     ┌─────────────▼──────────────┐
-                     │  PostgreSQL Shared Buffers  │
-                     │  (8 KB pages on disk)       │
-                     └────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph query [SQL Query]
+        Q["ORDER BY emb &lt;=&gt; q\nWHERE geom && bbox\nAND labels && '{2}'"]
+    end
+
+    query --> Executor["PostgreSQL Executor\n(Index Scan node)"]
+    Executor --> AM
+
+    subgraph AM ["geo_vec Access Method (amhandler / scan.rs)"]
+        direction TB
+        subgraph components [Components]
+            direction LR
+            Graph["Graph\n(DiskANN)"]
+            SpatialIdx["Spatial\nCell Index"]
+            LabelFilter["Label\nFilter"]
+        end
+        components --> Storage["Storage Layer\nPlain (f32) | SBQ (1-2 bit)"]
+        Storage --> Pages["Page / Buffer Utilities\nTape, ChainTape, LRU cache"]
+    end
+
+    AM --> Buffers["PostgreSQL Shared Buffers\n(8 KB pages on disk)"]
 ```
 
 ## Module Map
@@ -116,43 +100,35 @@ src/
 
 ## Index Build
 
-```
-CREATE INDEX ... USING geo_vec (embedding vector_cosine_ops,
-                                geom geometry_geo_vec_ops,
-                                labels vector_smallint_label_ops);
+```mermaid
+flowchart TD
+    CreateIdx["CREATE INDEX ... USING geo_vec"] --> ambuild
+    ambuild --> MetaPage["Create MetaPage\n(detect geometry column, set flags)"]
+    MetaPage --> PostGIS{"Has geometry?"}
+    PostGIS -->|Yes| LoadPostGIS["ensure_postgis_loaded()\n(dlsym force-load .so)"]
+    PostGIS -->|No| InitStorage
+    LoadPostGIS --> InitStorage["Initialize Storage (Plain or SBQ) + Graph"]
 
-ambuild()
-    │
-    ├─ Create MetaPage (detect geometry column, set flags)
-    ├─ If geometry: ensure_postgis_loaded() (dlsym force-load .so)
-    ├─ Initialize Storage (Plain or SBQ) + Graph
-    │
-    ▼
-Heap Scan  ─── for each row ───────────────────────────────┐
-    │                                                       │
-    │  Extract vector ──── LabeledVector::from_datums()     │
-    │  Extract bbox   ──── postgis_extract_bbox(geom)       │
-    │  Extract labels ──── parse smallint[]                 │
-    │                                                       │
-    │  Storage::create_node(vector, bbox, labels, heap_ptr) │
-    │      → Write PlainNode or SbqNode to Tape page        │
-    │      → Returns IndexPointer                           │
-    │                                                       │
-    │  Graph::greedy_search() → find neighbors              │
-    │  Graph::robust_prune() → select best edges            │
-    │                                                       │
-    │  Accumulate (IndexPointer, BBox2D) for spatial index  │
-    └───────────────────────────────────────────────────────┘
-    │
-    ▼
-finalize_build()
-    │
-    ├─ Write neighbor lists to nodes
-    ├─ If geometry:
-    │     SpatialCellIndexBuilder → CSR grid
-    │     ChainTapeWriter → write to pages
-    │     MetaPage.spatial_cell_index_start = pointer
-    └─ Store MetaPage to block 0
+    InitStorage --> HeapScan
+
+    subgraph HeapScan ["Heap Scan (for each row)"]
+        direction TB
+        Extract["Extract vector, bbox, labels\nfrom row datums"]
+        Extract --> CreateNode["Storage::create_node()\nWrite node to Tape page\nReturns IndexPointer"]
+        CreateNode --> GraphInsert["Graph::greedy_search()\nGraph::robust_prune()\nSelect best edges"]
+        GraphInsert --> Accumulate["Accumulate\n(IndexPointer, BBox2D)\nfor spatial index"]
+    end
+
+    HeapScan --> Finalize
+
+    subgraph Finalize ["finalize_build()"]
+        direction TB
+        WriteNeighbors["Write neighbor lists to nodes"]
+        WriteNeighbors --> BuildSpatial{"Has geometry?"}
+        BuildSpatial -->|Yes| CSR["SpatialCellIndexBuilder\nMulti-cell assignment\nCSR grid -> ChainTapeWriter"]
+        BuildSpatial -->|No| StoreMeta
+        CSR --> StoreMeta["Store MetaPage to block 0"]
+    end
 ```
 
 ### Parallel Build (PG17+)
@@ -163,52 +139,20 @@ For large tables, PG17's parallel index build is used. The leader coordinates wo
 
 The scan path selects a strategy based on the query predicates and the estimated number of spatial candidates:
 
-```
-amrescan(query_vector, query_bbox?, query_labels?)
-    │
-    ▼
-Has bbox AND spatial cell index exists?
-    │
-    ├── NO ──────────────────────────────────────┐
-    │                                             ▼
-    │                                   ┌─────────────────┐
-    │                                   │   GRAPH SEARCH   │
-    │                                   │  Standard DiskANN │
-    │                                   │  greedy search    │
-    │                                   │  + inline label   │
-    │                                   │    post-filter    │
-    │                                   └─────────────────┘
-    │
-    ├── YES
-    │     │
-    │     ▼
-    │   Count candidates in overlapping cells
-    │     │
-    │     ├── candidates <= threshold (default 5000)
-    │     │         │
-    │     │         ▼
-    │     │   ┌─────────────────────┐
-    │     │   │   BRUTE-FORCE SCAN   │
-    │     │   │  Load all nodes from  │
-    │     │   │  overlapping cells    │
-    │     │   │  Read vectors         │
-    │     │   │  Compute distances    │
-    │     │   │  Sort → top-K         │
-    │     │   │  (100% spatial recall)│
-    │     │   └─────────────────────┘
-    │     │
-    │     └── candidates > threshold
-    │               │
-    │               ▼
-    │         ┌──────────────────────┐
-    │         │  HYBRID SEARCH        │
-    │         │  sample_seeds_in_bbox │
-    │         │  → seed entry points  │
-    │         │  → graph traversal    │
-    │         │  + spatial post-filter│
-    │         │  + label post-filter  │
-    │         │  O(search_list) cost  │
-    │         └──────────────────────┘
+```mermaid
+flowchart TD
+    amrescan["amrescan(query_vector, query_bbox?, query_labels?)"]
+    amrescan --> HasBBox{"Has bbox AND\nspatial cell index?"}
+
+    HasBBox -->|No| GraphSearch["GRAPH SEARCH\nStandard DiskANN greedy search\n+ inline label post-filter"]
+
+    HasBBox -->|Yes| CountCandidates["Count candidates\nin overlapping cells"]
+
+    CountCandidates --> ThresholdCheck{"candidates <= threshold?\n(default 5000)"}
+
+    ThresholdCheck -->|Yes| BruteForce["BRUTE-FORCE SCAN\nLoad all nodes from overlapping cells\nDeduplicate (multi-cell)\nExact bbox filter\nCompute exact vector distances\nSort -> top-K\n(100% spatial recall)"]
+
+    ThresholdCheck -->|No| Hybrid["HYBRID SEARCH\nsample_seeds_in_bbox()\nSeed DiskANN graph entry points\nGraph traversal\n+ spatial post-filter\n+ label post-filter\nO(search_list_size) cost"]
 ```
 
 ### Why Three Paths?
@@ -225,49 +169,52 @@ Brute-force is exact but expensive for large regions. Hybrid seeds the DiskANN g
 
 A grid-based auxiliary structure stored in CSR (Compressed Sparse Row) format alongside the DiskANN graph.
 
-```
-Grid over data extent
-┌───┬───┬───┬───┐
-│ 0 │ 1 │ 2 │ 3 │     CSR Arrays:
-├───┼───┼───┼───┤
-│ 4 │ 5 │ 6 │ 7 │     cell_offsets: [0, 12, 25, 38, ...]  (num_cells + 1)
-├───┼───┼───┼───┤     node_pointers: [ptr_a, ptr_b, ...]   (all nodes, grouped by cell)
-│ 8 │ 9 │10 │11 │
-└───┴───┴───┴───┘     Nodes in cell i: node_pointers[cell_offsets[i]..cell_offsets[i+1]]
+```mermaid
+block-beta
+    columns 4
+    block:grid:4
+        columns 4
+        c0["Cell 0"] c1["Cell 1"] c2["Cell 2"] c3["Cell 3"]
+        c4["Cell 4"] c5["Cell 5"] c6["Cell 6"] c7["Cell 7"]
+        c8["Cell 8"] c9["Cell 9"] c10["Cell 10"] c11["Cell 11"]
+    end
 ```
 
-- Auto-sized to ~100 points per cell
-- Nodes assigned to cells by geometry centroid
-- `nodes_in_bbox()`: union of all nodes in overlapping grid cells
-- `sample_seeds_in_bbox()`: evenly-spaced samples from overlapping cells (for hybrid search entry points)
+**CSR storage**: `cell_offsets[i]..cell_offsets[i+1]` indexes into `node_pointers[]` to give all nodes in cell `i`.
+
+- **Auto-sized** to ~100 points per cell
+- **Multi-cell assignment**: each node is inserted into every cell its bounding box overlaps (not just its centroid cell). This guarantees that any query bbox overlapping a node's bbox will find it, regardless of geometry size. A small point-like building lands in 1 cell; a large polygon spanning many cells appears in all of them. Typical overhead is ~15-20% extra entries for building-scale data.
+- **`nodes_in_bbox()`**: union of all nodes in overlapping grid cells, deduplicated via `HashSet` (since a node may appear in multiple cells)
+- **`sample_seeds_in_bbox()`**: evenly-spaced samples from overlapping cells (for hybrid search entry points)
 - Serialized to chained pages via `ChainTapeWriter`
 
 ## Storage Layer
 
 Two storage backends, selected at index creation (default: SBQ).
 
-```
-┌──────────────────────────────────────────────────┐
-│                 Storage Trait                     │
-│  create_node()         get_query_distance_measure│
-│  visit_lsn()           get_full_distance_for_resort│
-│  return_lsn() → (HeapPointer, BBox2D)           │
-├────────────────────┬─────────────────────────────┤
-│   PlainStorage     │   SbqSpeedupStorage         │
-│                    │                              │
-│  PlainNode:        │  SbqNode:                   │
-│  ┌──────────────┐  │  ┌─────────────────────┐    │
-│  │ f32[] vector  │  │  │ u64[] quantized vec  │    │
-│  │ BBox2D        │  │  │ BBox2D               │    │
-│  │ labels[]      │  │  │ labels[]             │    │
-│  │ neighbors[]   │  │  │ neighbors[]          │    │
-│  │ heap_pointer  │  │  │ heap_pointer         │    │
-│  └──────────────┘  │  └─────────────────────┘    │
-│                    │                              │
-│  Distance:         │  Distance:                   │
-│  f32-to-f32        │  XOR Hamming (approximate)   │
-│  (exact)           │  + rescore from heap (exact)  │
-└────────────────────┴─────────────────────────────┘
+```mermaid
+classDiagram
+    class StorageTrait {
+        <<trait>>
+        +create_node()
+        +visit_lsn()
+        +return_lsn() HeapPointer, BBox2D
+        +get_query_distance_measure()
+        +get_full_distance_for_resort()
+    }
+
+    class PlainStorage {
+        PlainNode: f32 vector + BBox2D + labels + neighbors + heap_pointer
+        Distance: f32-to-f32 (exact)
+    }
+
+    class SbqSpeedupStorage {
+        SbqNode: u64 quantized vec + BBox2D + labels + neighbors + heap_pointer
+        Distance: XOR Hamming (approximate) + rescore from heap (exact)
+    }
+
+    StorageTrait <|-- PlainStorage
+    StorageTrait <|-- SbqSpeedupStorage
 ```
 
 **SBQ (Scalar Binary Quantization)** compresses each vector dimension to 1-2 bits using per-dimension mean/variance thresholds. Approximate distances are computed via SIMD XOR + popcount on quantized representations. The top-K candidates are then rescored using full-precision vectors fetched from the heap.
@@ -286,22 +233,15 @@ The graph is fully connected (no partitioning) to maintain high recall for pure 
 
 `geo_vec` reads bounding boxes from PostGIS `geometry` values without a link-time dependency:
 
-```
-postgis_extract_bbox(geom_datum)
-    │
-    ▼
-Read GSERIALIZED header bytes
-    │
-    ├── gflags bit 2 set (BBOX cached)?
-    │       │
-    │       ├── YES → read 4 x f32 directly from header → BBox2D
-    │       │         (no PostGIS function call, fast path)
-    │       │
-    │       └── NO → dlsym("LWGEOM_to_BOX2DF")
-    │                 → DirectFunctionCall1Coll → BBox2D
-    │
-    └── ensure_postgis_loaded() called once at build start
-          → SPI query pg_extension → load_file(postgis .so path)
+```mermaid
+flowchart TD
+    Extract["postgis_extract_bbox(geom_datum)"]
+    Extract --> ReadHeader["Read GSERIALIZED header bytes"]
+    ReadHeader --> BBoxCached{"gflags bit 2 set?\n(BBOX cached)"}
+    BBoxCached -->|Yes| FastPath["Read 4 x f32 directly\nfrom header -> BBox2D\n(no PostGIS function call)"]
+    BBoxCached -->|No| SlowPath["dlsym LWGEOM_to_BOX2DF\nDirectFunctionCall1Coll\n-> BBox2D"]
+
+    note["ensure_postgis_loaded() called once at build start\nSPI query pg_extension -> load_file(postgis .so path)"]
 ```
 
 The geometry column is identified by `format_type_be()` returning `"geometry"`, and uses operator strategy 6 for the `&&` operator in the access method.

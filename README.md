@@ -110,6 +110,8 @@ CREATE INDEX idx_diskann ON places USING diskann (embedding vector_cosine_ops);
 
 - [Quick Start Guide](docs/QUICKSTART.md) — installation, setup, first queries
 - [API Reference](docs/API.md) — operator classes, GUC parameters, helper functions
+- [Architecture](docs/ARCHITECTURE.md) — internals, index build, query routing, storage
+- [Roadmap](docs/ROADMAP.md) — planned improvements
 
 ## Development
 

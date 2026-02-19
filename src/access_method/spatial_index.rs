@@ -7,6 +7,8 @@
 //! recall by finding all nodes in overlapping cells, computing vector distances,
 //! and returning top-K results.
 
+use std::collections::HashSet;
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::partition::BBox2D;
@@ -86,13 +88,6 @@ impl SpatialGridConfig {
 
     /// Find all cell indices that overlap with the given bbox.
     pub fn bbox_to_cells(&self, bbox: &BBox2D) -> Vec<usize> {
-        self.bbox_to_cells_with_margin(bbox, 0)
-    }
-
-    /// Find all cell indices that overlap with the given bbox, expanded by
-    /// `margin` cells in each direction. This accounts for nodes whose centroids
-    /// are in adjacent cells but whose actual geometry overlaps the query bbox.
-    pub fn bbox_to_cells_with_margin(&self, bbox: &BBox2D, margin: u32) -> Vec<usize> {
         let width = (self.xmax - self.xmin).max(f32::MIN_POSITIVE);
         let height = (self.ymax - self.ymin).max(f32::MIN_POSITIVE);
 
@@ -108,11 +103,6 @@ impl SpatialGridConfig {
         let max_row = ((bbox.ymax - self.ymin) / height * self.rows as f32)
             .floor()
             .clamp(0.0, (self.rows - 1) as f32) as u32;
-
-        let min_col = min_col.saturating_sub(margin);
-        let max_col = (max_col + margin).min(self.cols - 1);
-        let min_row = min_row.saturating_sub(margin);
-        let max_row = (max_row + margin).min(self.rows - 1);
 
         let mut cells = Vec::new();
         for row in min_row..=max_row {
@@ -141,16 +131,19 @@ pub struct SpatialCellIndex {
 
 impl SpatialCellIndex {
     /// Return all node pointers whose cells overlap the query bbox.
-    /// Uses a 1-cell margin to capture nodes whose centroids are in adjacent
-    /// cells but whose actual bboxes overlap the query; callers apply an exact
-    /// bbox filter to remove false positives.
+    /// Deduplicates because a node may appear in multiple cells.
     pub fn nodes_in_bbox(&self, query_bbox: &BBox2D) -> Vec<ItemPointer> {
-        let cells = self.grid.bbox_to_cells_with_margin(query_bbox, 1);
+        let cells = self.grid.bbox_to_cells(query_bbox);
+        let mut seen = HashSet::new();
         let mut result = Vec::new();
         for cell_idx in cells {
             let start = self.cell_offsets[cell_idx] as usize;
             let end = self.cell_offsets[cell_idx + 1] as usize;
-            result.extend_from_slice(&self.node_pointers[start..end]);
+            for &ip in &self.node_pointers[start..end] {
+                if seen.insert(ip) {
+                    result.push(ip);
+                }
+            }
         }
         result
     }
@@ -160,13 +153,12 @@ impl SpatialCellIndex {
     /// Returns `(seeds, total_candidate_count)` where `total_candidate_count` is the
     /// total number of nodes in overlapping cells (used for threshold decisions).
     /// Seeds are evenly-spaced samples from each cell (up to `max_per_cell` per cell).
-    /// Uses a 1-cell margin to capture edge-case nodes near cell boundaries.
     pub fn sample_seeds_in_bbox(
         &self,
         query_bbox: &BBox2D,
         max_per_cell: usize,
     ) -> (Vec<ItemPointer>, usize) {
-        let cells = self.grid.bbox_to_cells_with_margin(query_bbox, 1);
+        let cells = self.grid.bbox_to_cells(query_bbox);
         let mut seeds = Vec::new();
         let mut total_count: usize = 0;
 
@@ -218,16 +210,15 @@ impl SpatialCellIndexBuilder {
         Self { grid, entries }
     }
 
-    /// Add a node to the cell(s) it belongs to, based on its bbox centroid.
+    /// Add a node to every cell its bbox overlaps, guaranteeing that any
+    /// query bbox overlapping the node's bbox will find it.
     pub fn add(&mut self, index_pointer: ItemPointer, bbox: &BBox2D) {
         if bbox.is_empty() {
             return;
         }
-        let cx = (bbox.xmin + bbox.xmax) / 2.0;
-        let cy = (bbox.ymin + bbox.ymax) / 2.0;
-        let (col, row) = self.grid.point_to_cell(cx, cy);
-        let cell_idx = self.grid.cell_index(col, row);
-        self.entries[cell_idx].push(index_pointer);
+        for cell_idx in self.grid.bbox_to_cells(bbox) {
+            self.entries[cell_idx].push(index_pointer);
+        }
     }
 
     /// Build the CSR structure.
@@ -449,7 +440,13 @@ mod tests {
             builder.add(ip, &bbox);
         }
         let index = builder.build();
-        assert_eq!(index.node_pointers.len(), 8494);
+        // With multi-cell assignment, nodes at cell boundaries may appear in
+        // multiple cells, so total entries >= unique node count.
+        assert!(
+            index.node_pointers.len() >= 8494,
+            "expected at least 8494 entries, got {}",
+            index.node_pointers.len()
+        );
     }
 
     #[test]
@@ -471,7 +468,8 @@ mod tests {
 
         // Sample seeds from the full extent
         let (seeds, total) = index.sample_seeds_in_bbox(&extent, 2);
-        assert_eq!(total, 1000, "total count should match all nodes");
+        // total counts CSR entries (may include multi-cell duplicates)
+        assert!(total >= 1000, "total count should be at least 1000, got {}", total);
         // Seeds should be much fewer than total
         assert!(seeds.len() <= index.grid.num_cells() * 2);
         assert!(!seeds.is_empty());
@@ -546,5 +544,66 @@ mod tests {
         builder.add(ItemPointer::new(1, 1), &BBox2D::empty());
         let index = builder.build();
         assert_eq!(index.node_pointers.len(), 0);
+    }
+
+    #[test]
+    fn test_large_geom_found_in_all_overlapping_cells() {
+        let extent = buildings_extent();
+        let grid = SpatialGridConfig::from_extent(extent, 8494);
+        let mut builder = SpatialCellIndexBuilder::new(grid);
+
+        // Large geometry spanning roughly half the extent (many cells)
+        let large_bbox = BBox2D::new(-117.600, -117.585, 47.650, 47.656);
+        let ip = ItemPointer::new(1, 1);
+        builder.add(ip, &large_bbox);
+
+        let index = builder.build();
+
+        // Query a small bbox at the far-right edge of the large geom,
+        // far from its centroid. Must still find the node.
+        let edge_query = BBox2D::new(-117.586, -117.585, 47.655, 47.656);
+        let nodes = index.nodes_in_bbox(&edge_query);
+        assert!(
+            nodes.contains(&ip),
+            "large geom should be found when querying its edge, got {} nodes",
+            nodes.len()
+        );
+    }
+
+    #[test]
+    fn test_multi_cell_assignment_duplicates() {
+        let extent = buildings_extent();
+        let grid = SpatialGridConfig::from_extent(extent, 8494);
+
+        // Build a bbox that spans exactly 4 cells (2x2 block)
+        let cell_w = (extent.xmax - extent.xmin) / grid.cols as f32;
+        let cell_h = (extent.ymax - extent.ymin) / grid.rows as f32;
+        // Span from middle of cell (1,1) to middle of cell (2,2)
+        let bbox = BBox2D::new(
+            extent.xmin + 1.5 * cell_w,
+            extent.xmin + 2.5 * cell_w,
+            extent.ymin + 1.5 * cell_h,
+            extent.ymin + 2.5 * cell_h,
+        );
+
+        let mut builder = SpatialCellIndexBuilder::new(grid);
+        let ip = ItemPointer::new(42, 1);
+        builder.add(ip, &bbox);
+        let index = builder.build();
+
+        // Node should appear in 4 cells (2x2)
+        assert_eq!(
+            index.node_pointers.len(),
+            4,
+            "node spanning 2x2 cells should appear 4 times in CSR"
+        );
+
+        // nodes_in_bbox should return the node deduplicated
+        let found = index.nodes_in_bbox(&bbox);
+        assert_eq!(
+            found.iter().filter(|&&p| p == ip).count(),
+            1,
+            "nodes_in_bbox should deduplicate"
+        );
     }
 }
