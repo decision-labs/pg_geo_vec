@@ -104,87 +104,88 @@ geo_vec      ██████░░░░░░░░░ 10.2
 
 Reading: on **selective** boxes (medium ~22% / narrow ~6% of rows), post-filter ANN is “fast” in EXPLAIN but almost useless once recall is folded in. `geo_vec` wins the product metric because it keeps **20/20**. **Wide (~57% of rows)** is a weak filter — closer to unfiltered ANN — so HNSW can keep 20/20 and win on raw speed; that is expected, not a geo_vec failure.
 
-### Speed bars — longer = faster, recall underneath
+### Speed bars — longer = faster, recall underneath (full bar = 100%)
 
-Latency bars mislead (longer looks “better”). These bars are **speed** (`∝ 1/latency`), so longer is genuinely better. Absolute ms stay on the right. Recall sits under each method — read both.
+Latency bars mislead (longer looks “better”). These bars are **speed** (`∝ 1/latency`), so longer is genuinely better. Absolute ms stay on the right.  
+**Recall bar is fixed-width: 20 blocks = 100% (20/20).** geo_vec fills the bar on every query below.
 
 ```
-medium bbox (~22% / 70K)          scale: longer bar = faster
+medium bbox (~22% / 70K)          scale: longer speed bar = faster
   HNSW+GiST
     speed   ████████████████████····  37.4 ms
-    recall  █·······················   1/20   ← fast, wrong
+    recall  █···················   5% (1/20)   ← fast, wrong
   DiskANN+GiST
     speed   ██████████████████······  40.3 ms
-    recall  █████████████···········  13/20
+    recall  █████████████·······  65% (13/20)
   geo_vec
     speed   █████████████████·······  43.3 ms
-    recall  ████████████████████····  20/20   ← slightly slower, correct
+    recall  ████████████████████ 100% (20/20)  ← slightly slower, correct
 
 narrow bbox (~6% / 20K)
   HNSW+GiST
     speed   ████████████████████····  38.3 ms
-    recall  ························   0/20   ← fastest, empty result
+    recall  ····················   0% (0/20)   ← fastest, empty result
   DiskANN+GiST
     speed   ██████████████████······  41.5 ms
-    recall  ████████████████········  16/20
+    recall  ████████████████····  80% (16/20)
   geo_vec
     speed   █████████████████·······  43.2 ms
-    recall  ████████████████████····  20/20
+    recall  ████████████████████ 100% (20/20)
 
 wide bbox (~57% / 182K) — weak filter; closer to unfiltered ANN
   HNSW+GiST
     speed   ████████████████████····  39.5 ms
-    recall  ████████████████████····  20/20   ← legit win: fast + correct
+    recall  ████████████████████ 100% (20/20)  ← legit win: fast + correct
   DiskANN+GiST
     speed   ███████████████████·····  40.7 ms
-    recall  █████████████████·······  17/20
+    recall  █████████████████···  85% (17/20)
   geo_vec
     speed   ████████················  97.6 ms
-    recall  ████████████████████····  20/20
+    recall  ████████████████████ 100% (20/20)
 
 vector-only (no spatial filter)
   geo_vec
     speed   ████████████████████····  25.2 ms
-    recall  ████████████████████····  20/20
+    recall  ████████████████████ 100% (20/20)
   HNSW
     speed   ████████████████████····  25.6 ms
-    recall  ████████████████████····  20/20
+    recall  ████████████████████ 100% (20/20)
   DiskANN
     speed   ████████████████████····  25.9 ms
-    recall  ████████████████████····  20/20
+    recall  ████████████████████ 100% (20/20)
   seqscan
     speed   █████···················  98.6 ms
-    recall  ████████████████████····  exact
+    recall  ████████████████████ 100% (exact)
 ```
 
 ### Same data as a recall × latency map
 
 ```
-Recall@20
-    20 ┤
+Recall
+  100% ┤
        │
        │   H(w)                     G(m)  G(n)                    G(w)
        │
        │
-    17 ┤        D(w)
+   85% ┤        D(w)
        │
        │
-    16 ┤              D(n)
+   80% ┤              D(n)
        │
        │
-    13 ┤                    D(m)
+   65% ┤                    D(m)
        │
        │
-    10 ┤
+   50% ┤
        │
        │
-     5 ┤
+   25% ┤
        │
        │
-     1 ┤     H(m)
+    5% ┤     H(m)
        │
        │
-     0 ┤           H(n)
+    0% ┤           H(n)
        │
        └──────────────────────────────────────────────────────► latency (ms)
            25          40           60           80          100
@@ -192,7 +193,8 @@ Recall@20
   G = geo_vec   H = HNSW+GiST   D = DiskANN+GiST
   (w) wide≈57%  (m) medium≈22%  (n) narrow≈6%   of 318K rows
 
-  Ideal corner = top-left (high recall, low latency).
+  Y = Recall@20 as percent (20/20 = 100%). geo_vec sits on the 100% line for all three bboxes.
+  Ideal corner = top-left (100% recall, low latency).
   Bottom-left  = fast and wrong.  Top-right = correct but slow.
 ```
 
