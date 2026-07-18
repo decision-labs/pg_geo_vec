@@ -104,6 +104,59 @@ geo_vec      ██████░░░░░░░░░ 10.2
 
 Reading: on **selective** boxes (medium ~22% / narrow ~6% of rows), post-filter ANN is “fast” in EXPLAIN but almost useless once recall is folded in. `geo_vec` wins the product metric because it keeps **20/20**. **Wide (~57% of rows)** is a weak filter — closer to unfiltered ANN — so HNSW can keep 20/20 and win on raw speed; that is expected, not a geo_vec failure.
 
+### Latency bars — speed, with recall underneath
+
+Bar length = latency (shorter is faster). The line under each bar is Recall@20 — read both before calling a method “faster.”
+
+```
+medium bbox (~22% / 70K)
+  HNSW+GiST
+    speed   ███████████████·············  37.4 ms
+    recall  █···························   1/20
+  DiskANN+GiST
+    speed   ████████████████············  40.3 ms
+    recall  █████████████···············  13/20
+  geo_vec
+    speed   █████████████████···········  43.3 ms
+    recall  ████████████████████········  20/20
+
+narrow bbox (~6% / 20K)
+  HNSW+GiST
+    speed   ███████████████·············  38.3 ms
+    recall  ····························   0/20
+  DiskANN+GiST
+    speed   ████████████████············  41.5 ms
+    recall  ████████████████············  16/20
+  geo_vec
+    speed   █████████████████···········  43.2 ms
+    recall  ████████████████████········  20/20
+
+wide bbox (~57% / 182K) — weak filter; closer to unfiltered ANN
+  HNSW+GiST
+    speed   ████████████████············  39.5 ms
+    recall  ████████████████████········  20/20
+  DiskANN+GiST
+    speed   ████████████████············  40.7 ms
+    recall  █████████████████···········  17/20
+  geo_vec
+    speed   ███████████████████████████████████████  97.6 ms
+    recall  ████████████████████········  20/20
+
+vector-only (no spatial filter)
+  geo_vec
+    speed   ██████████··················  25.2 ms
+    recall  ████████████████████········  20/20
+  HNSW
+    speed   ██████████··················  25.6 ms
+    recall  ████████████████████········  20/20
+  DiskANN
+    speed   ██████████··················  25.9 ms
+    recall  ████████████████████········  20/20
+  seqscan
+    speed   ███████████████████████████████████████  98.6 ms
+    recall  ████████████████████········  exact
+```
+
 ### Same data as a recall × latency map
 
 ```
