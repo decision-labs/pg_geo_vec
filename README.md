@@ -81,19 +81,52 @@ The threshold is controlled by `geo_vec.spatial_brute_force_threshold` (default:
 
 ## Benchmarks
 
-**Kigoto: 318K rows, 384-dim vectors, cosine distance** (warm `EXPLAIN ANALYZE`, PG17):
+Local PG17 run (`make bench-kigoto`): **318,375 rows**, 384-dim cosine, Recall@20 vs exact seqscan ground truth.
 
-| Query | Path | geo_vec recall | geo_vec latency | HNSW+GiST recall |
-|---|---|---|---|---|
-| Tiny bbox (~1–2K candidates) | Brute-force | 20/20 | ~40ms | — |
-| Narrow bbox (~20K candidates) | Hybrid | 20/20 | ~45ms | **0/20** |
-| Medium bbox (~70K candidates) | Hybrid | 20/20 | ~41ms | **1/20** |
-| Wide bbox (~180K / ≈57% of rows) | Hybrid | 20/20 | ~40ms | 20/20 |
-| Pure vector | Graph | 20/20 | ~26ms | 20/20 |
+### Recall@20 — who actually finds the right neighbors?
 
-On selective filters (narrow/medium), HNSW+GiST is fast but **recall collapses**; geo_vec keeps 20/20. On a very wide bbox (~57% of the table), both can hit 20/20 and effective QPS may favor HNSW — the planner should not blindly always pick geo_vec (see below).
+```
+                wide   medium  narrow  vector-only
+                ────   ──────  ──────  ───────────
+geo_vec         ████   ████    ████    ████         20  20  20  20
+HNSW + GiST     ████   ░       ·       ████         20   1   0  20
+DiskANN + GiST  ███░   ███·    ███░    ████         17  13  16  20
 
-**Buildings: ~8.5K rows** — geo_vec and HNSW+GiST both reach 20/20 on the same bbox suite (small enough that HNSW+GiST remains accurate).
+████ = 20/20   ███░ ≈ 15–19   ███· ≈ 10–14   ░ = 1–5   · = 0
+```
+
+On selective spatial filters, post-filtering ANN (HNSW/DiskANN + GiST) can look fine on latency while quietly returning the wrong set. `geo_vec` keeps full recall because spatial + vector share one index scan.
+
+### Latency (EXPLAIN Analyze, ms) — Kigoto 318K
+
+```
+wide bbox (~182K candidates)
+  geo_vec         ████████████████████████████████████████  97.6 ms   ★ 20/20
+  HNSW+GiST       ████████████████                          39.5 ms     20/20
+  DiskANN+GiST    █████████████████                         40.7 ms     17/20
+  seqscan         █████████████████████████████████████     91.5 ms   (exact)
+
+medium bbox (~70K candidates)
+  geo_vec         █████████████████                         43.3 ms   ★ 20/20
+  HNSW+GiST       ███████████████                           37.4 ms      1/20
+  DiskANN+GiST    ████████████████                          40.3 ms     13/20
+
+narrow bbox (~20K candidates)
+  geo_vec         █████████████████                         43.2 ms   ★ 20/20
+  HNSW+GiST       ███████████████                           38.3 ms      0/20
+  DiskANN+GiST    ████████████████                          41.5 ms     16/20
+  seqscan         ██████████████████████████████████        85.4 ms   (exact)
+
+vector-only (no spatial filter)
+  geo_vec         ██████████                                25.2 ms   ★ 20/20
+  HNSW            ██████████                                25.6 ms     20/20
+  DiskANN         ██████████                                25.9 ms     20/20
+  seqscan         ███████████████████████████████████████   98.6 ms   (exact)
+```
+
+`★` = best recall at that query shape. HNSW/DiskANN win raw ms on some spatial queries, but on medium/narrow Kigoto boxes that speed is mostly empty calories.
+
+Smaller fixture (`make bench-buildings`, 8.5K × 1024-d): all three approaches hit 20/20 on most cases; DiskANN+GiST dipped to 16–19/20 on wider boxes. Re-run anytime with the `make bench-*` targets.
 
 ### Planner cardinality (index choice)
 
