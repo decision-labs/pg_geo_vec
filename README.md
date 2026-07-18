@@ -89,42 +89,58 @@ Local PG17 (`make bench-kigoto`): **318,375 rows**, 384-dim cosine. Recall@20 vs
 ### Effective QPS (speed × recall) — Kigoto spatial queries
 
 ```
-medium bbox (~70K in-box)          narrow bbox (~20K in-box)
+medium bbox (~22% / 70K in-box)    narrow bbox (~6% / 20K in-box)
 ─────────────────────────────────  ─────────────────────────────────
 geo_vec      ████████████████ 23.1  geo_vec      ████████████████ 23.1   (20/20 @ 43ms)
 DiskANN+GiST ███████████░░░░ 16.1  DiskANN+GiST █████████████░░ 19.3   (13–16/20)
 HNSW+GiST    █░░░░░░░░░░░░░░  1.3  HNSW+GiST    ···············  0.0   (1/20, 0/20)
 
-wide bbox (~182K in-box)           vector-only (no spatial filter)
+wide bbox (~57% / 182K in-box)     vector-only (no spatial filter)
 ─────────────────────────────────  ─────────────────────────────────
 HNSW+GiST    ████████████████ 25.3  geo_vec / HNSW / DiskANN ≈ 39 QPS  (all 20/20 @ ~25ms)
 DiskANN+GiST █████████████░░ 20.9  seqscan                     ≈ 10 QPS  (exact @ ~99ms)
 geo_vec      ██████░░░░░░░░░ 10.2
 ```
 
-Reading: on **selective** boxes (medium/narrow), post-filter ANN is “fast” in EXPLAIN but almost useless once recall is folded in. `geo_vec` wins the product metric because it keeps **20/20**. On a **wide** box where HNSW still hits 20/20, raw speed legitimately wins — that is fine; use the composite index when spatial selectivity hurts ANN+filter.
+Reading: on **selective** boxes (medium ~22% / narrow ~6% of rows), post-filter ANN is “fast” in EXPLAIN but almost useless once recall is folded in. `geo_vec` wins the product metric because it keeps **20/20**. **Wide (~57% of rows)** is a weak filter — closer to unfiltered ANN — so HNSW can keep 20/20 and win on raw speed; that is expected, not a geo_vec failure.
 
 ### Same data as a recall × latency map
 
 ```
 Recall@20
-    20 ┤  H(w)              G(m) G(n)
-       │  D(w)·
-    15 ┤         D(n) D(m)
+    20 ┤
+       │
+       │   H(w)                     G(m)  G(n)                    G(w)
+       │
+       │
+    17 ┤        D(w)
+       │
+       │
+    16 ┤              D(n)
+       │
+       │
+    13 ┤                    D(m)
+       │
        │
     10 ┤
        │
+       │
      5 ┤
-       │  H(m)
-     0 ┤              H(n)
-       └──────────────────────────────────► latency (ms)
-          25        40         60        100
+       │
+       │
+     1 ┤     H(m)
+       │
+       │
+     0 ┤           H(n)
+       │
+       └──────────────────────────────────────────────────────► latency (ms)
+           25          40           60           80          100
 
   G = geo_vec   H = HNSW+GiST   D = DiskANN+GiST
-  (w) wide  (m) medium  (n) narrow
+  (w) wide≈57%  (m) medium≈22%  (n) narrow≈6%   of 318K rows
 
   Ideal corner = top-left (high recall, low latency).
-  Bottom-left = fast and wrong. Top-right = correct but slow.
+  Bottom-left  = fast and wrong.  Top-right = correct but slow.
 ```
 
 ### Raw numbers (transparency)
