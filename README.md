@@ -11,7 +11,7 @@ Built on the DiskANN graph algorithm (forked from [pgvectorscale](https://github
 - **Single composite index** for vector + geometry columns (no separate GiST index needed)
 - **Three-way query routing**: brute-force for small regions, hybrid spatial-seeded graph for large regions, pure graph for vector-only
 - **DiskANN graph** with SBQ compression for vector similarity
-- **Spatial cell index** (CSR grid) for 100% spatial recall on brute-force path
+- **Spatial cell index** (CSR grid) for high spatial recall on the brute-force path (see [limitations](#limitations))
 - **Label filtering** via `smallint[]` overlap operator
 - **Coexists with pgvectorscale** — both extensions can be installed in the same database
 
@@ -121,6 +121,16 @@ bash test_data/run_planner_before_after.sh   # inside geo_vec_test:pg17 containe
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#planner-cost-estimation) for how `amcostestimate` works.
 
+## Limitations
+
+### Incremental spatial index
+
+Rows inserted after `CREATE INDEX` go into a spatial overflow segment. Scans union that segment with the base CSR, so new rows stay visible to brute-force and hybrid paths without `REINDEX`. `VACUUM`, or an insert that pushes overflow postings past `geo_vec.spatial_overflow_compact_threshold` (default 10000), rebuilds the CSR and clears overflow.
+
+- Overflow is rewritten on each insert.
+- Inserts outside the index extent clamp to boundary cells until compact expands the grid.
+- `UPDATE` is delete + insert. Removed CSR slots stay until compact.
+
 ## pgvectorscale Coexistence
 
 `geo_vec` can be installed alongside pgvectorscale in the same database. All SQL functions are prefixed with `geo_vec_` to avoid name collisions:
@@ -164,4 +174,6 @@ podman run --rm -v $(pwd):/workspace geo_vec_test bash /workspace/test_data/ci_t
 
 ## License
 
-MIT OR Apache-2.0
+This project is licensed under the [PostgreSQL License](LICENSE).
+
+It includes substantial code derived from [pgvectorscale](https://github.com/timescale/pgvectorscale) by Timescale, Inc. See [NOTICE](NOTICE) for attribution.

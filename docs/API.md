@@ -134,11 +134,13 @@ Standard DiskANN greedy search. Same behavior as pgvectorscale.
 
 ### 2. Small bbox (candidates < threshold) -> Brute-force
 
-Loads all matching nodes from the spatial cell index, computes exact distances, returns top-K. Guarantees 100% spatial recall.
+Loads all matching nodes from the spatial cell index (base CSR plus overflow), computes exact distances, returns top-K. See [Limitations](../README.md#limitations).
 
 ### 3. Large bbox (candidates >= threshold) -> Hybrid spatial-seeded graph
 
 Samples seed nodes from overlapping grid cells, feeds them as entry points into the DiskANN graph, applies spatial post-filtering during traversal. Much faster than brute-force for large regions.
+
+> **Note:** Inserts after build stay visible through the overflow segment. `VACUUM` or `geo_vec.spatial_overflow_compact_threshold` folds overflow back into the CSR. See [Limitations](../README.md#limitations).
 
 ## SQL Helper Functions
 

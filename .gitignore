@@ -3,7 +3,6 @@
 /target
 *.iml
 **/*.rs.bk
-Cargo.lock
 *.swp
 # will have compiled files and executables
 debug
@@ -15,8 +14,10 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# Large test data files (download via scripts)
+# Large test data files (download via scripts) — see test_data/README.md
 test_data/kigoto_embeddings.parquet
+# After redistribution is confirmed and a download URL exists, also ignore:
+# test_data/building_detection_embeddings.parquet
 
 _external_pre_dates_this_project_geovectorscale_does_not_work_here
 

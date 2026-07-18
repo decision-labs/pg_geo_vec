@@ -70,4 +70,17 @@ echo ">>> Running label filtering tests..."
 su postgres -c "psql -h /var/run/postgresql -d postgres -f /workspace/test_data/test_label_filtering.sql"
 
 echo ""
+echo ">>> Coexistence smoke: build diskann index alongside geo_vec..."
+su postgres -c "psql -h /var/run/postgresql -d postgres -c \"
+CREATE INDEX IF NOT EXISTS buildings_diskann_idx ON buildings
+    USING diskann (embedding vector_cosine_ops);
+SELECT amname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_am am ON am.oid = c.relam
+WHERE i.indrelid = 'buildings'::regclass
+ORDER BY amname;
+\""
+
+echo ""
 echo ">>> All CI tests passed!"

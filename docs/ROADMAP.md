@@ -42,7 +42,7 @@ An **STR R-tree** mainly helps when multi-cell duplication and large polygons in
 
 **Biggest lever: incremental CSR (or append segments + merge).**
 
-Until INSERT/UPDATE/VACUUM maintain the spatial structure, every mutable workload forces `REINDEX` — that dwarfs query-path tuning for real deployments.
+Inserts already append to overflow and compact on VACUUM / threshold, so spatial scans see new rows without `REINDEX`. Remaining write cost is overflow rewrite-on-insert and UPDATE (delete+insert); segment chaining is the next step.
 
 ### Bottom line
 

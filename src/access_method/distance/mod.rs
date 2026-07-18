@@ -78,12 +78,12 @@ compile_error!(
 pub fn init() {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
-        panic!("On x86, pgvectorscale requires the CPU to support AVX2 and FMA. See https://github.com/timescale/pgvectorscale/issues/115");
+        panic!("On x86, geo_vec requires the CPU to support AVX2 and FMA. See https://github.com/timescale/pgvectorscale/issues/115");
     }
 
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     if !std::arch::is_aarch64_feature_detected!("neon") {
-        panic!("On aarch64, pgvectorscale requires the CPU to support Neon. See https://github.com/timescale/pgvectorscale/issues/115");
+        panic!("On aarch64, geo_vec requires the CPU to support Neon. See https://github.com/timescale/pgvectorscale/issues/115");
     }
 }
 

@@ -183,11 +183,13 @@ unsafe fn extract_bbox_from_gserialized(
     };
 
     let bbox_ptr = payload.add(bbox_offset) as *const f32;
+    // Offset can be odd (v2 extended header) and short-varlena payloads may be
+    // misaligned; always use unaligned loads for portability (esp. aarch64).
     Some(super::BBox2D {
-        xmin: *bbox_ptr,
-        xmax: *bbox_ptr.add(1),
-        ymin: *bbox_ptr.add(2),
-        ymax: *bbox_ptr.add(3),
+        xmin: core::ptr::read_unaligned(bbox_ptr),
+        xmax: core::ptr::read_unaligned(bbox_ptr.add(1)),
+        ymin: core::ptr::read_unaligned(bbox_ptr.add(2)),
+        ymax: core::ptr::read_unaligned(bbox_ptr.add(3)),
     })
 }
 
@@ -210,10 +212,10 @@ unsafe fn postgis_extract_bbox_fallback(geom_datum: pg_sys::Datum) -> Option<sup
         return None;
     }
     Some(super::BBox2D {
-        xmin: *ptr,
-        xmax: *ptr.add(1),
-        ymin: *ptr.add(2),
-        ymax: *ptr.add(3),
+        xmin: core::ptr::read_unaligned(ptr),
+        xmax: core::ptr::read_unaligned(ptr.add(1)),
+        ymin: core::ptr::read_unaligned(ptr.add(2)),
+        ymax: core::ptr::read_unaligned(ptr.add(3)),
     })
 }
 
