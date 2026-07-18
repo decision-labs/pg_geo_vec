@@ -81,52 +81,67 @@ The threshold is controlled by `geo_vec.spatial_brute_force_threshold` (default:
 
 ## Benchmarks
 
-Local PG17 run (`make bench-kigoto`): **318,375 rows**, 384-dim cosine, Recall@20 vs exact seqscan ground truth.
+The useful metric is not raw latency — it is **how fast you get the right neighbors**.
 
-### Recall@20 — who actually finds the right neighbors?
+Local PG17 (`make bench-kigoto`): **318,375 rows**, 384-dim cosine. Recall@20 vs exact seqscan.  
+**Effective QPS** = `(recall / 20) × (1000 / latency_ms)` — queries/sec weighted by recall. A method that returns in 40ms with 0/20 recall scores **0**.
 
-```
-                wide   medium  narrow  vector-only
-                ────   ──────  ──────  ───────────
-geo_vec         ████   ████    ████    ████         20  20  20  20
-HNSW + GiST     ████   ░       ·       ████         20   1   0  20
-DiskANN + GiST  ███░   ███·    ███░    ████         17  13  16  20
-
-████ = 20/20   ███░ ≈ 15–19   ███· ≈ 10–14   ░ = 1–5   · = 0
-```
-
-On selective spatial filters, post-filtering ANN (HNSW/DiskANN + GiST) can look fine on latency while quietly returning the wrong set. `geo_vec` keeps full recall because spatial + vector share one index scan.
-
-### Latency (EXPLAIN Analyze, ms) — Kigoto 318K
+### Effective QPS (speed × recall) — Kigoto spatial queries
 
 ```
-wide bbox (~182K candidates)
-  geo_vec         ████████████████████████████████████████  97.6 ms   ★ 20/20
-  HNSW+GiST       ████████████████                          39.5 ms     20/20
-  DiskANN+GiST    █████████████████                         40.7 ms     17/20
-  seqscan         █████████████████████████████████████     91.5 ms   (exact)
+medium bbox (~70K in-box)          narrow bbox (~20K in-box)
+─────────────────────────────────  ─────────────────────────────────
+geo_vec      ████████████████ 23.1  geo_vec      ████████████████ 23.1   (20/20 @ 43ms)
+DiskANN+GiST ███████████░░░░ 16.1  DiskANN+GiST █████████████░░ 19.3   (13–16/20)
+HNSW+GiST    █░░░░░░░░░░░░░░  1.3  HNSW+GiST    ···············  0.0   (1/20, 0/20)
 
-medium bbox (~70K candidates)
-  geo_vec         █████████████████                         43.3 ms   ★ 20/20
-  HNSW+GiST       ███████████████                           37.4 ms      1/20
-  DiskANN+GiST    ████████████████                          40.3 ms     13/20
-
-narrow bbox (~20K candidates)
-  geo_vec         █████████████████                         43.2 ms   ★ 20/20
-  HNSW+GiST       ███████████████                           38.3 ms      0/20
-  DiskANN+GiST    ████████████████                          41.5 ms     16/20
-  seqscan         ██████████████████████████████████        85.4 ms   (exact)
-
-vector-only (no spatial filter)
-  geo_vec         ██████████                                25.2 ms   ★ 20/20
-  HNSW            ██████████                                25.6 ms     20/20
-  DiskANN         ██████████                                25.9 ms     20/20
-  seqscan         ███████████████████████████████████████   98.6 ms   (exact)
+wide bbox (~182K in-box)           vector-only (no spatial filter)
+─────────────────────────────────  ─────────────────────────────────
+HNSW+GiST    ████████████████ 25.3  geo_vec / HNSW / DiskANN ≈ 39 QPS  (all 20/20 @ ~25ms)
+DiskANN+GiST █████████████░░ 20.9  seqscan                     ≈ 10 QPS  (exact @ ~99ms)
+geo_vec      ██████░░░░░░░░░ 10.2
 ```
 
-`★` = best recall at that query shape. HNSW/DiskANN win raw ms on some spatial queries, but on medium/narrow Kigoto boxes that speed is mostly empty calories.
+Reading: on **selective** boxes (medium/narrow), post-filter ANN is “fast” in EXPLAIN but almost useless once recall is folded in. `geo_vec` wins the product metric because it keeps **20/20**. On a **wide** box where HNSW still hits 20/20, raw speed legitimately wins — that is fine; use the composite index when spatial selectivity hurts ANN+filter.
 
-Smaller fixture (`make bench-buildings`, 8.5K × 1024-d): all three approaches hit 20/20 on most cases; DiskANN+GiST dipped to 16–19/20 on wider boxes. Re-run anytime with the `make bench-*` targets.
+### Same data as a recall × latency map
+
+```
+Recall@20
+    20 ┤  H(w)              G(m) G(n)
+       │  D(w)·
+    15 ┤         D(n) D(m)
+       │
+    10 ┤
+       │
+     5 ┤
+       │  H(m)
+     0 ┤              H(n)
+       └──────────────────────────────────► latency (ms)
+          25        40         60        100
+
+  G = geo_vec   H = HNSW+GiST   D = DiskANN+GiST
+  (w) wide  (m) medium  (n) narrow
+
+  Ideal corner = top-left (high recall, low latency).
+  Bottom-left = fast and wrong. Top-right = correct but slow.
+```
+
+### Raw numbers (transparency)
+
+| Query | Method | Latency | Recall@20 | Effective QPS |
+|-------|--------|--------:|----------:|--------------:|
+| medium | **geo_vec** | 43.3 ms | **20/20** | **23.1** |
+| medium | DiskANN+GiST | 40.3 ms | 13/20 | 16.1 |
+| medium | HNSW+GiST | 37.4 ms | 1/20 | 1.3 |
+| narrow | **geo_vec** | 43.2 ms | **20/20** | **23.1** |
+| narrow | DiskANN+GiST | 41.5 ms | 16/20 | 19.3 |
+| narrow | HNSW+GiST | 38.3 ms | 0/20 | 0.0 |
+| wide | HNSW+GiST | 39.5 ms | 20/20 | 25.3 |
+| wide | DiskANN+GiST | 40.7 ms | 17/20 | 20.9 |
+| wide | geo_vec | 97.6 ms | 20/20 | 10.2 |
+
+Smaller fixture (`make bench-buildings`, 8.5K × 1024-d): recall stays high for all methods, so the story collapses back toward plain latency. The failure mode shows up at scale + selective filters — re-run with `make bench-kigoto`.
 
 ### Planner cardinality (index choice)
 
