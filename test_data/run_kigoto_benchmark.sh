@@ -53,10 +53,10 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
     su postgres -c "/usr/lib/postgresql/17/bin/initdb -D $PGDATA"
 
     cat >> "$PGDATA/postgresql.conf" <<EOF
-shared_buffers = '512MB'
+shared_buffers = '1GB'
 work_mem = '128MB'
 maintenance_work_mem = '1GB'
-effective_cache_size = '1GB'
+effective_cache_size = '3GB'
 max_parallel_maintenance_workers = 0
 EOF
 else

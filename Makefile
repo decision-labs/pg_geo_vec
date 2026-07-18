@@ -1,6 +1,20 @@
 IMAGE := geo_vec_test
+PG_FEATURE := pg17
+RUSTFLAGS_X86 := -C target-feature=+avx2,+fma
 
-.PHONY: docker-image bench-buildings bench-kigoto bench-buildings-rebuild bench-kigoto-rebuild
+.PHONY: docker-image test test-unit test-integration clippy bench-buildings bench-kigoto bench-buildings-rebuild bench-kigoto-rebuild
+
+test-unit:
+	cargo test --no-default-features --features $(PG_FEATURE)
+
+test-integration: docker-image
+	docker run --rm -v $(PWD):/workspace $(IMAGE) \
+		bash -c 'cd /workspace && cargo pgrx test --no-default-features --features $(PG_FEATURE)'
+
+test: test-unit
+
+clippy:
+	cargo clippy --no-default-features --features $(PG_FEATURE)
 
 docker-image:
 	docker build -t $(IMAGE) -f Containerfile.test .
