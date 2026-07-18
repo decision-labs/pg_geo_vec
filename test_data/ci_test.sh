@@ -1,8 +1,16 @@
 #!/bin/bash
 # CI integration test: build extension, load buildings data, run recall tests
+# Optional: PG_MAJOR=17|18 (default 17)
 set -euo pipefail
 
 cd /workspace
+
+PG_MAJOR="${PG_MAJOR:-17}"
+PG_FEATURE="pg${PG_MAJOR}"
+PG_BIN="/usr/lib/postgresql/${PG_MAJOR}/bin"
+PGDATA="/var/lib/postgresql/${PG_MAJOR}/main"
+
+echo ">>> Target PostgreSQL ${PG_MAJOR} (feature ${PG_FEATURE})"
 
 # ---------- Detect architecture for SIMD flags ----------
 ARCH=$(uname -m)
@@ -16,8 +24,8 @@ else
 fi
 
 # ---------- Build extension ----------
-echo ">>> Building geo_vec extension (release) for $ARCH..."
-cargo pgrx install --release --no-default-features --features pg17 2>&1
+echo ">>> Building geo_vec extension (release) for $ARCH / PG${PG_MAJOR}..."
+cargo pgrx install --release --no-default-features --features "${PG_FEATURE}" 2>&1
 
 echo ""
 echo ">>> Installed files:"
@@ -27,19 +35,19 @@ ls -la "$(pg_config --sharedir)"/extension/geo_vec* 2>/dev/null || true
 
 # ---------- Initialize PostgreSQL ----------
 echo ""
-echo ">>> Initializing PostgreSQL..."
-mkdir -p /var/run/postgresql /var/lib/postgresql/17/main
-chown postgres:postgres /var/run/postgresql /var/lib/postgresql/17/main
-su postgres -c "/usr/lib/postgresql/17/bin/initdb -D /var/lib/postgresql/17/main"
+echo ">>> Initializing PostgreSQL ${PG_MAJOR}..."
+mkdir -p /var/run/postgresql "${PGDATA}"
+chown postgres:postgres /var/run/postgresql "${PGDATA}"
+su postgres -c "${PG_BIN}/initdb -D ${PGDATA}"
 
-cat >> /var/lib/postgresql/17/main/postgresql.conf <<EOF
+cat >> "${PGDATA}/postgresql.conf" <<EOF
 shared_buffers = '256MB'
 work_mem = '64MB'
 maintenance_work_mem = '512MB'
 EOF
 
 echo ">>> Starting PostgreSQL..."
-su postgres -c "/usr/lib/postgresql/17/bin/pg_ctl -D /var/lib/postgresql/17/main start -l /tmp/pg.log -o '-k /var/run/postgresql'"
+su postgres -c "${PG_BIN}/pg_ctl -D ${PGDATA} start -l /tmp/pg.log -o '-k /var/run/postgresql'"
 for i in $(seq 1 10); do
     su postgres -c "pg_isready -h /var/run/postgresql" >/dev/null 2>&1 && echo ">>> Ready." && break
     sleep 1
@@ -83,4 +91,4 @@ ORDER BY amname;
 \""
 
 echo ""
-echo ">>> All CI tests passed!"
+echo ">>> All CI tests passed (PG${PG_MAJOR})!"

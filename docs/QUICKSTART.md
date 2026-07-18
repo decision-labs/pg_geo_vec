@@ -15,6 +15,8 @@
 ```bash
 cargo install cargo-pgrx --version 0.16.1 --locked
 cargo pgrx init --pg17=/usr/bin/pg_config
+# Optional PG18 testing:
+# cargo pgrx init --pg18=/usr/bin/pg_config
 ```
 
 ### 2. Build and install geo_vec

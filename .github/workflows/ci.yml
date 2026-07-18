@@ -26,17 +26,22 @@ on:
 
 jobs:
   build:
-    name: Build (${{ matrix.arch }})
+    name: Build (PG${{ matrix.pg }} / ${{ matrix.arch }})
     # GitHub-hosted ubuntu-latest is blocked by the org spending limit.
     # Repo-level self-hosted runners: datamuncher-geo-vec-21..23 (x86_64 only).
     runs-on: [self-hosted, Linux, X64]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
             rustflags: "-C target-feature=+avx2,+fma"
+            pg: 17
+          - arch: x86_64
+            rustflags: "-C target-feature=+avx2,+fma"
+            pg: 18
     container:
-      image: docker.io/postgres:17
+      image: docker.io/postgres:${{ matrix.pg }}
       options: --user root
     steps:
       - uses: actions/checkout@v4
@@ -45,8 +50,9 @@ jobs:
         run: |
           apt-get update && apt-get install -y \
             build-essential pkg-config libssl-dev libreadline-dev zlib1g-dev \
-            curl git postgresql-server-dev-17 postgresql-17-postgis-3 \
-            postgresql-17-pgvector clang llvm \
+            curl git postgresql-server-dev-${{ matrix.pg }} \
+            postgresql-${{ matrix.pg }}-postgis-3 \
+            postgresql-${{ matrix.pg }}-pgvector clang llvm \
             && rm -rf /var/lib/apt/lists/*
 
       - name: Install Rust
@@ -61,8 +67,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-cargo-
+          key: ${{ runner.os }}-${{ matrix.arch }}-pg${{ matrix.pg }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-pg${{ matrix.pg }}-cargo-
 
       - name: Install cargo-pgrx
         run: |
@@ -72,12 +78,12 @@ jobs:
       - name: Initialize pgrx
         run: |
           . $HOME/.cargo/env
-          cargo pgrx init --pg17=/usr/bin/pg_config
+          cargo pgrx init --pg${{ matrix.pg }}=/usr/bin/pg_config
 
       - name: Build extension
         run: |
           . $HOME/.cargo/env
-          RUSTFLAGS="${{ matrix.rustflags }}" cargo build --no-default-features --features pg17
+          RUSTFLAGS="${{ matrix.rustflags }}" cargo build --no-default-features --features pg${{ matrix.pg }}
 
       - name: Return workspace to the host runner
         if: always()
@@ -94,13 +100,17 @@ jobs:
           fi
 
   integration:
-    name: Integration Tests (${{ matrix.arch }})
+    name: Integration (PG${{ matrix.pg }} / ${{ matrix.arch }})
     runs-on: [self-hosted, Linux, X64]
     needs: build
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
+            pg: 17
+          - arch: x86_64
+            pg: 18
     steps:
       - name: Reclaim workspace ownership
         run: |
@@ -116,13 +126,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build test container
-        run: docker build -t geo_vec_test -f Containerfile.test .
+        run: |
+          docker build \
+            --build-arg PG_MAJOR=${{ matrix.pg }} \
+            -t geo_vec_test_pg${{ matrix.pg }} \
+            -f Containerfile.test .
 
       - name: Run integration tests
         run: |
           docker run --rm \
+            -e PG_MAJOR=${{ matrix.pg }} \
             -v ${{ github.workspace }}:/workspace \
-            geo_vec_test bash /workspace/test_data/ci_test.sh
+            geo_vec_test_pg${{ matrix.pg }} bash /workspace/test_data/ci_test.sh
 
       - name: Return workspace to the host runner
         if: always()

@@ -1,4 +1,7 @@
-FROM docker.io/postgres:17
+ARG PG_MAJOR=17
+FROM docker.io/postgres:${PG_MAJOR}
+
+ARG PG_MAJOR=17
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -9,9 +12,9 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     curl \
     git \
-    postgresql-server-dev-17 \
-    postgresql-17-postgis-3 \
-    postgresql-17-pgvector \
+    postgresql-server-dev-${PG_MAJOR} \
+    postgresql-${PG_MAJOR}-postgis-3 \
+    postgresql-${PG_MAJOR}-pgvector \
     clang \
     llvm \
     python3-pip \
@@ -29,12 +32,13 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 RUN cargo install cargo-pgrx --version 0.16.1 --locked
 
 # Initialize pgrx with the system PostgreSQL
-RUN cargo pgrx init --pg17=/usr/bin/pg_config
+RUN cargo pgrx init --pg${PG_MAJOR}=/usr/bin/pg_config
 
-# Build and install pgvectorscale (DiskANN)
+# Build and install pgvectorscale (DiskANN) for the same PG major
 RUN git clone --branch 0.9.0 --depth 1 https://github.com/timescale/pgvectorscale.git /tmp/pgvectorscale \
     && cd /tmp/pgvectorscale/pgvectorscale \
-    && cargo pgrx install --release --no-default-features --features pg17 \
+    && cargo pgrx install --release --no-default-features --features pg${PG_MAJOR} \
     && rm -rf /tmp/pgvectorscale
 
+ENV PG_MAJOR=${PG_MAJOR}
 WORKDIR /workspace

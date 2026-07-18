@@ -161,15 +161,22 @@ export RUSTFLAGS="-C target-feature=+avx2,+fma"
 export MACOSX_DEPLOYMENT_TARGET=$(sw_vers -productVersion)
 export RUSTFLAGS="-C target-feature=+neon -C link-arg=-Wl,-undefined,dynamic_lookup"
 
-# Build (debug)
+# Build (debug) — default features already include pg17
+cargo build
+
+# Or explicitly:
 cargo build --no-default-features --features pg17
+cargo build --no-default-features --features pg18
 
 # Build (release)
 cargo pgrx install --release --no-default-features --features pg17
+# PG18:
+# cargo pgrx init --pg18=/usr/bin/pg_config
+# cargo pgrx install --release --no-default-features --features pg18
 
-# Integration tests (requires podman/docker)
-podman build -t geo_vec_test -f Containerfile.test .
-podman run --rm -v $(pwd):/workspace geo_vec_test bash /workspace/test_data/ci_test.sh
+# Integration tests (requires docker/podman) — PG17 and PG18
+make test-pg17
+make test-pg18
 ```
 
 ## License
