@@ -18,6 +18,7 @@ mod scan;
 pub mod stats;
 mod storage;
 pub mod spatial_index;
+mod spatial_maintain;
 mod storage_common;
 mod type_utils;
 mod vacuum;

@@ -19,3 +19,7 @@ target
 test_data/kigoto_embeddings.parquet
 
 _external_pre_dates_this_project_geovectorscale_does_not_work_here
+
+# Ephemeral planner A/B artifacts (generated locally)
+test_data/_cost_estimate.*.rs
+test_data/planner_choice_*.log

@@ -88,7 +88,7 @@ ORDER BY embedding <=> query_vec
 LIMIT 20;
 ```
 
-The `&&` operator triggers spatial filtering within the geo_vec index. The query planner uses a single index scan — no separate GiST index needed.
+The `&&` operator triggers spatial filtering within the geo_vec index. Prefer a composite `(embedding, geom)` index so one scan handles both predicates. When HNSW and GiST also exist, the planner chooses using geo_vec’s cardinality-aware costs — selective bboxes should prefer geo_vec (see [ARCHITECTURE](ARCHITECTURE.md#planner-cost-estimation)).
 
 ### Pure vector search
 
@@ -159,9 +159,17 @@ FROM pg_indexes WHERE tablename = 'places';
 -- Force index scan for testing
 SET enable_seqscan = off;
 EXPLAIN (ANALYZE) SELECT ... ORDER BY embedding <=> ... LIMIT 20;
+
+-- With competing indexes: which AM did the planner pick?
+EXPLAIN (COSTS)
+SELECT id FROM places
+WHERE geom && ST_MakeEnvelope(...)
+ORDER BY embedding <=> query_vec
+LIMIT 20;
 ```
 
 ## Next Steps
 
 - See [API.md](API.md) for the complete API reference
-- See the `test_data/` directory for integration test examples
+- See [ARCHITECTURE.md](ARCHITECTURE.md#planner-cost-estimation) for planner cardinality / `amcostestimate`
+- See the `test_data/` directory for integration tests (`make bench-kigoto`, `make bench-planner-choice`)

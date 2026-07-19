@@ -8,6 +8,8 @@ pub static TSV_MIN_VECTORS_FOR_PARALLEL_BUILD: GucSetting<i32> = GucSetting::<i3
 pub static TSV_FORCE_PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(-1);
 pub static TSV_SPATIAL_BRUTE_FORCE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(5000);
 pub static TSV_SPATIAL_SEEDS_PER_CELL: GucSetting<i32> = GucSetting::<i32>::new(2);
+/// Compact overflow into base CSR when this many posting entries accumulate (VACUUM or insert).
+pub static TSV_SPATIAL_OVERFLOW_COMPACT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(10_000);
 
 pub fn init() {
     GucRegistry::define_int_guc(
@@ -145,6 +147,29 @@ pub fn init() {
         &TSV_SPATIAL_SEEDS_PER_CELL,
         1,
         100,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        unsafe {
+            std::ffi::CStr::from_ptr("geo_vec.spatial_overflow_compact_threshold".as_pg_cstr())
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Overflow posting count that triggers CSR compact on VACUUM or insert"
+                    .as_pg_cstr(),
+            )
+        },
+        unsafe {
+            std::ffi::CStr::from_ptr(
+                "Inserts after CREATE INDEX append to a spatial overflow segment. When the overflow reaches this many (cell,node) postings, compact rebuilds the base CSR (also runs on VACUUM if overflow is non-empty)."
+                    .as_pg_cstr(),
+            )
+        },
+        &TSV_SPATIAL_OVERFLOW_COMPACT_THRESHOLD,
+        1,
+        i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );

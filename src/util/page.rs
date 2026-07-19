@@ -36,6 +36,8 @@ pub enum PageType {
     SbqMeans = 7,
     Meta = 8,
     SpatialCellIndex = 9,
+    /// Append-only overflow postings for nodes inserted after CSR build.
+    SpatialOverflow = 10,
 }
 
 impl PageType {
@@ -51,6 +53,7 @@ impl PageType {
             7 => PageType::SbqMeans,
             8 => PageType::Meta,
             9 => PageType::SpatialCellIndex,
+            10 => PageType::SpatialOverflow,
             _ => panic!("Unknown PageType number {}", value),
         }
     }
@@ -61,7 +64,10 @@ impl PageType {
     pub fn is_chained(self) -> bool {
         matches!(
             self,
-            PageType::SbqMeans | PageType::Meta | PageType::SpatialCellIndex
+            PageType::SbqMeans
+                | PageType::Meta
+                | PageType::SpatialCellIndex
+                | PageType::SpatialOverflow
         )
     }
 }

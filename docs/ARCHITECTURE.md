@@ -78,7 +78,7 @@ src/
 │   ├── type_utils.rs         ← geometry_type_oid(), is_geometry_column()
 │   ├── pg_vector.rs          ← PgVector: wrapper for pgvector's vector type
 │   ├── node.rs               ← ReadableNode / WriteableNode traits
-│   ├── cost_estimate.rs      ← amcostestimate() for planner
+│   ├── cost_estimate.rs      ← amcostestimate(): spatial sel + LIMIT + brute/hybrid/graph work
 │   ├── vacuum.rs             ← ambulkdelete(), amvacuumcleanup()
 │   ├── stats.rs              ← Internal statistics
 │   └── debugging.rs
@@ -164,6 +164,64 @@ flowchart TD
 | **Graph** | No bbox | O(search_list_size) | ~95-100% |
 
 Brute-force is exact but expensive for large regions. Hybrid seeds the DiskANN graph with spatially-relevant entry points, achieving near-perfect recall at fixed cost. The threshold (GUC `geo_vec.spatial_brute_force_threshold`, default 5000) controls the crossover.
+
+## Incremental CSR (inserts after build)
+
+After `CREATE INDEX`, the base CSR blob is not rewritten on every insert. Instead:
+
+1. **INSERT** — node is written to the DiskANN graph as before; its `(cell_id, IndexPointer)` postings are appended to a `SpatialOverflowIndex` ChainTape (`PageType::SpatialOverflow`), referenced from MetaPage.
+2. **Scan** — `nodes_in_bbox` / `sample_seeds_in_bbox` union base CSR + overflow (deleted nodes still filtered at read time).
+3. **Compact** — when overflow postings ≥ `geo_vec.spatial_overflow_compact_threshold`, or on index `VACUUM`, rebuild CSR via graph walk and clear overflow.
+
+If the index was built with no rows, the first geometry insert creates a one-node CSR. Inserts outside the original grid extent clamp into boundary cells until the next compact recomputes extent.
+
+## Planner Cost Estimation
+
+Runtime already knows CSR candidate counts when the scan starts. The planner must decide **before** that — via `amcostestimate` in `cost_estimate.rs` — whether to use `geo_vec` vs HNSW+GiST (or seqscan).
+
+### What the cost model estimates
+
+1. **Spatial selectivity** — `clauselist_selectivity` on indexclause RestrictInfos (typically `geom && bbox`).
+2. **Candidate count** — `cand ≈ selectivity × n`.
+3. **Work (numIndexTuples)** aligned with scan routing:
+   - no spatial qual → graph work ~ `search_list` (not `n/100`)
+   - `cand ≤ spatial_brute_force_threshold` → brute → examine ~`cand`
+   - else → hybrid → seed + graph work (grows with `√cand`, capped by `cand`)
+4. **Return selectivity** — ANN `ORDER BY … LIMIT k` returns ≈ `k` rows (`PlannerInfo.limit_tuples`, else `search_list`).
+
+```mermaid
+flowchart LR
+    Quals["indexclauses\n(geom && bbox)"] --> Sel["clauselist_selectivity"]
+    Sel --> Cand["cand = sel × n"]
+    Limit["limit_tuples / search_list"] --> Ret["indexSelectivity ≈ k/n"]
+    Cand --> Route{"cand ≤ threshold?"}
+    Route -->|yes| Brute["numIndexTuples ≈ cand"]
+    Route -->|no| Hybrid["numIndexTuples ≈ √cand + search_list"]
+    Brute --> Generic["genericcostestimate"]
+    Hybrid --> Generic
+    Generic --> Costs["startup / total cost\n+ ann selectivity"]
+```
+
+### Why this matters (Kigoto)
+
+On ~318K rows, a **narrow/medium** bbox needs geo_vec for recall (HNSW+GiST often returns 0–1 of the true top-20). A **wide** bbox (~57% of rows) is a weak filter: both AMs can hit 20/20 recall, so cost/cardinality should not treat every bbox the same.
+
+| Bbox | Competing indexes — old `n/100` | Competing indexes — current model |
+|---|---|---|
+| tiny | geo_vec | geo_vec |
+| narrow | HNSW | geo_vec |
+| medium | HNSW | geo_vec |
+| wide | HNSW | geo_vec (cost rises vs narrow) |
+
+Smoke: `make bench-planner-choice` (builds `kigoto_planner` with geo_vec + HNSW + GiST). Details and numbers: [README Benchmarks](../README.md#benchmarks).
+
+### Limits
+
+- Selectivity quality depends on Postgres/PostGIS stats for `&&`; bad stats ⇒ wrong `cand`.
+- The model approximates CSR counts; it does not read the CSR at plan time.
+- Preferring geo_vec on very wide filters may overshoot effective QPS — tune thresholds / revisit costs if production plans look wrong.
+
+Further planner and scan improvements (wide-bbox penalty, MetaPage histograms, incremental CSR, spatial node layout): [ROADMAP](ROADMAP.md).
 
 ## Spatial Cell Index
 
