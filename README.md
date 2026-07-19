@@ -4,6 +4,8 @@
 
 A PostgreSQL extension for **combined vector similarity search + spatial filtering** using a single composite index.
 
+> **Private beta (`0.1.0-beta.1`)** — for Decision Labs / GeoBase internal use. Not a public crates.io release. See [docs/BETA.md](docs/BETA.md).
+
 Built on the DiskANN graph algorithm (forked from [pgvectorscale](https://github.com/timescale/pgvectorscale)), `geo_vec` adds a spatial cell index that enables fast approximate nearest neighbor queries constrained to a geographic bounding box — all in one index scan.
 
 ## Key Features
@@ -164,4 +166,4 @@ podman run --rm -v $(pwd):/workspace geo_vec_test bash /workspace/test_data/ci_t
 
 ## License
 
-MIT OR Apache-2.0
+[PostgreSQL License](LICENSE) (Timescale pgvectorscale lineage + Decision Labs contributions). See [NOTICE](NOTICE).
