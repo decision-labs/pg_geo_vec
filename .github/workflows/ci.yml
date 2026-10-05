@@ -79,6 +79,20 @@ jobs:
           . $HOME/.cargo/env
           RUSTFLAGS="${{ matrix.rustflags }}" cargo build --no-default-features --features pg17
 
+      - name: Return workspace to the host runner
+        if: always()
+        run: |
+          # This job checks out as root. The workspace directory stays owned by
+          # the host runner; children do not. Hand them back so the next host
+          # job can clean the tree.
+          uid=$(stat -c '%u' "${GITHUB_WORKSPACE}")
+          gid=$(stat -c '%g' "${GITHUB_WORKSPACE}")
+          if [ "$uid" = 0 ]; then
+            chmod -R a+rwX "${GITHUB_WORKSPACE}"
+          else
+            chown -R "${uid}:${gid}" "${GITHUB_WORKSPACE}"
+          fi
+
   integration:
     name: Integration Tests (${{ matrix.arch }})
     runs-on: [self-hosted, Linux, X64]
@@ -88,6 +102,17 @@ jobs:
         include:
           - arch: x86_64
     steps:
+      - name: Reclaim workspace ownership
+        run: |
+          # A previous root container can leave directories actions/checkout cannot
+          # delete (EACCES on rmdir) before this host-side job does any work.
+          if [ -d "${GITHUB_WORKSPACE}" ] && [ -n "$(ls -A "${GITHUB_WORKSPACE}" 2>/dev/null || true)" ]; then
+            docker run --rm --entrypoint chown \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
+              docker.io/alpine:3 \
+              -R "$(id -u):$(id -g)" /workspace
+          fi
+
       - uses: actions/checkout@v4
 
       - name: Build test container
@@ -98,3 +123,11 @@ jobs:
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             geo_vec_test bash /workspace/test_data/ci_test.sh
+
+      - name: Return workspace to the host runner
+        if: always()
+        run: |
+          docker run --rm --entrypoint chown \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            docker.io/alpine:3 \
+            -R "$(id -u):$(id -g)" /workspace
