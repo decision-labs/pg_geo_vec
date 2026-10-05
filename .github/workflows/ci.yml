@@ -5,38 +5,116 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'pg_geo_vec_derive/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'geo_vec.control'
       - 'sql/**'
       - 'Containerfile.test'
       - 'test_data/**'
+      - 'Makefile'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
-    paths:
-      - 'src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'geo_vec.control'
-      - 'sql/**'
-      - 'Containerfile.test'
-      - 'test_data/**'
-      - '.github/workflows/ci.yml'
+    # No top-level paths filter: a PR that already touched code would re-run on
+    # every docs-only push. The `changes` job gates expensive work instead.
+
+# New pushes cancel older CI for the same PR/branch (stops README-push pileups).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build (${{ matrix.arch }})
+  changes:
+    name: Detect code changes
     # GitHub-hosted ubuntu-latest is blocked by the org spending limit.
-    # Repo-level self-hosted runners: datamuncher-geo-vec-21..23 (x86_64 only).
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      code: ${{ steps.check.outputs.code }}
+    steps:
+      - name: Reclaim workspace ownership
+        run: |
+          # A previous root container can leave directories actions/checkout cannot
+          # delete (EACCES on rmdir) before this host-side job does any work.
+          if [ -d "${GITHUB_WORKSPACE}" ] && [ -n "$(ls -A "${GITHUB_WORKSPACE}" 2>/dev/null || true)" ]; then
+            docker run --rm --entrypoint chown \
+              -v "${GITHUB_WORKSPACE}:/workspace" \
+              docker.io/alpine:3 \
+              -R "$(id -u):$(id -g)" /workspace
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # PR workflows default to a merge commit; use the branch tip so HEAD~1
+          # is the previous push commit when action == synchronize.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Check whether this push/PR update touches code
+        id: check
+        run: |
+          set -euo pipefail
+
+          is_code() {
+            case "$1" in
+              src/*|pg_geo_vec_derive/*|sql/*|Cargo.toml|Cargo.lock|geo_vec.control|Containerfile.test|test_data/*|Makefile|.github/workflows/*)
+                return 0 ;;
+              *)
+                return 1 ;;
+            esac
+          }
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if [ "${{ github.event.action }}" = "synchronize" ]; then
+              # Files in the latest commit(s) of this push — skip docs-only updates
+              # on PRs that already contain code earlier in history.
+              RANGE="HEAD~1..HEAD"
+            else
+              RANGE="${{ github.event.pull_request.base.sha }}..HEAD"
+            fi
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              RANGE="HEAD~1..HEAD"
+            else
+              RANGE="${BEFORE}..HEAD"
+            fi
+          fi
+
+          echo "Diff range: ${RANGE}"
+          mapfile -t FILES < <(git diff --name-only ${RANGE} || true)
+          printf 'Changed files:\n'
+          printf '  %s\n' "${FILES[@]:-(none)}"
+
+          CODE=false
+          for f in "${FILES[@]:-}"; do
+            [ -z "$f" ] && continue
+            if is_code "$f"; then
+              CODE=true
+              break
+            fi
+          done
+
+          echo "code=${CODE}" >> "$GITHUB_OUTPUT"
+          echo "Code changes detected: ${CODE}"
+
+  build:
+    name: Build (PG${{ matrix.pg }} / ${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: [self-hosted, Linux, X64]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
             rustflags: "-C target-feature=+avx2,+fma"
+            pg: 17
+          - arch: x86_64
+            rustflags: "-C target-feature=+avx2,+fma"
+            pg: 18
     container:
-      image: docker.io/postgres:17
+      image: docker.io/postgres:${{ matrix.pg }}
       options: --user root
     steps:
       - uses: actions/checkout@v4
@@ -45,8 +123,9 @@ jobs:
         run: |
           apt-get update && apt-get install -y \
             build-essential pkg-config libssl-dev libreadline-dev zlib1g-dev \
-            curl git postgresql-server-dev-17 postgresql-17-postgis-3 \
-            postgresql-17-pgvector clang llvm \
+            curl git postgresql-server-dev-${{ matrix.pg }} \
+            postgresql-${{ matrix.pg }}-postgis-3 \
+            postgresql-${{ matrix.pg }}-pgvector clang llvm \
             && rm -rf /var/lib/apt/lists/*
 
       - name: Install Rust
@@ -61,8 +140,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-cargo-
+          key: ${{ runner.os }}-${{ matrix.arch }}-pg${{ matrix.pg }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.arch }}-pg${{ matrix.pg }}-cargo-
 
       - name: Install cargo-pgrx
         run: |
@@ -72,12 +151,12 @@ jobs:
       - name: Initialize pgrx
         run: |
           . $HOME/.cargo/env
-          cargo pgrx init --pg17=/usr/bin/pg_config
+          cargo pgrx init --pg${{ matrix.pg }}=/usr/bin/pg_config
 
       - name: Build extension
         run: |
           . $HOME/.cargo/env
-          RUSTFLAGS="${{ matrix.rustflags }}" cargo build --no-default-features --features pg17
+          RUSTFLAGS="${{ matrix.rustflags }}" cargo build --no-default-features --features pg${{ matrix.pg }}
 
       - name: Return workspace to the host runner
         if: always()
@@ -94,18 +173,21 @@ jobs:
           fi
 
   integration:
-    name: Integration Tests (${{ matrix.arch }})
+    name: Integration (PG${{ matrix.pg }} / ${{ matrix.arch }})
     runs-on: [self-hosted, Linux, X64]
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.code == 'true'
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
+            pg: 17
+          - arch: x86_64
+            pg: 18
     steps:
       - name: Reclaim workspace ownership
         run: |
-          # A previous root container can leave directories actions/checkout cannot
-          # delete (EACCES on rmdir) before this host-side job does any work.
           if [ -d "${GITHUB_WORKSPACE}" ] && [ -n "$(ls -A "${GITHUB_WORKSPACE}" 2>/dev/null || true)" ]; then
             docker run --rm --entrypoint chown \
               -v "${GITHUB_WORKSPACE}:/workspace" \
@@ -116,13 +198,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build test container
-        run: docker build -t geo_vec_test -f Containerfile.test .
+        run: |
+          docker build \
+            --build-arg PG_MAJOR=${{ matrix.pg }} \
+            -t geo_vec_test_pg${{ matrix.pg }} \
+            -f Containerfile.test .
 
       - name: Run integration tests
         run: |
           docker run --rm \
+            -e PG_MAJOR=${{ matrix.pg }} \
             -v ${{ github.workspace }}:/workspace \
-            geo_vec_test bash /workspace/test_data/ci_test.sh
+            geo_vec_test_pg${{ matrix.pg }} bash /workspace/test_data/ci_test.sh
 
       - name: Return workspace to the host runner
         if: always()

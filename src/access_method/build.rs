@@ -669,11 +669,11 @@ fn maybe_train_quantizer(
     write_stats
 }
 
-const PARALLEL_BUILD_MAIN: *const c_char = c"_vectorscale_build_main".as_ptr();
+const PARALLEL_BUILD_MAIN: *const c_char = c"_geo_vec_build_main".as_ptr();
 #[pg_guard]
 #[unsafe(no_mangle)]
 #[cfg(feature = "build_parallel")]
-pub extern "C-unwind" fn _vectorscale_build_main(
+pub extern "C-unwind" fn _geo_vec_build_main(
     _seg: *mut pg_sys::dsm_segment,
     shm_toc: *mut pg_sys::shm_toc,
 ) {

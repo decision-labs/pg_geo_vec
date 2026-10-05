@@ -1,8 +1,15 @@
 [package]
 name = "pg_geo_vec"
 version = "0.1.0"
-authors = ["Your Name <your@email.com>"]
+authors = [
+    "Shoaib Burq <saburq@gmail.com>",
+    "Decision Labs contributors",
+]
 edition = "2021"
+license = "PostgreSQL"
+description = "PostgreSQL extension: composite vector similarity + spatial filtering index"
+repository = "https://github.com/decision-labs/pg_geo_vec"
+readme = "README.md"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,7 +19,9 @@ name = "pgrx_embed_pg_geo_vec"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg18", "build_parallel"]
+# Default to PG17 (primary supported line). PG18 is fully supported for builds/tests
+# via --features pg18 or `make test-pg18` / CI matrix.
+default = ["pg17", "build_parallel"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
