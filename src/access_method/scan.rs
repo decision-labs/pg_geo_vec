@@ -10,12 +10,12 @@ use crate::{
         pg_vector::PgVector,
         sbq::storage::SbqSpeedupStorage,
         spatial_index::SpatialCellIndex,
+        spatial_maintain,
         storage_common::get_index_vector_attribute,
     },
     partition::BBox2D,
     util::{
         buffer::PinnedBufferShare,
-        chain::ChainItemReader,
         ports::pgstat_count_index_scan,
         table_slot::TableSlot,
         HeapPointer, IndexPointer,
@@ -37,7 +37,7 @@ use super::{
         storage::SbqSpeedupStorageLsnPrivateData,
         SbqMeans, SbqSearchDistanceMeasure,
     },
-    stats::{QuantizerStats, WriteStats},
+    stats::{QuantizerStats},
     storage::{ArchivedData, Storage, StorageType},
 };
 
@@ -106,18 +106,30 @@ impl TSVScanState {
         // Three-way routing for spatial queries
         if let Some(ref qbbox) = query_bbox {
             if let Some(sci_start) = meta_page.get_spatial_cell_index_start() {
-                let cell_index = Self::load_spatial_cell_index(index, sci_start);
+                let cell_index = spatial_maintain::load_spatial_cell_index(index, sci_start);
+                let overflow = spatial_maintain::load_spatial_overflow(index, &meta_page);
                 let seeds_per_cell =
                     super::guc::TSV_SPATIAL_SEEDS_PER_CELL.get().max(1) as usize;
-                let (seeds, total_candidates) =
-                    cell_index.sample_seeds_in_bbox(qbbox, seeds_per_cell);
+                let (seeds, total_candidates) = cell_index.sample_seeds_in_bbox_with_overflow(
+                    qbbox,
+                    seeds_per_cell,
+                    overflow.as_ref(),
+                );
                 let threshold =
                     super::guc::TSV_SPATIAL_BRUTE_FORCE_THRESHOLD.get().max(0) as usize;
 
                 if total_candidates <= threshold {
                     // Small candidate set → brute-force (100% recall)
                     let store_type = Self::initialize_spatial_scan_from_index(
-                        index, heap, &meta_page, &query, qbbox, &cell_index, distance, snapshot,
+                        index,
+                        heap,
+                        &meta_page,
+                        &query,
+                        qbbox,
+                        &cell_index,
+                        overflow.as_ref(),
+                        distance,
+                        snapshot,
                     );
                     self.storage = PgMemoryContexts::CurrentMemoryContext
                         .leak_and_drop_on_delete(store_type);
@@ -126,11 +138,12 @@ impl TSVScanState {
                 } else {
                     // Large candidate set → hybrid spatial-seeded graph search
                     debug1!(
-                        "Spatial hybrid: {} total candidates > {} threshold, using {} seeds from {} cells",
+                        "Spatial hybrid: {} total candidates > {} threshold, using {} seeds from {} cells (overflow={})",
                         total_candidates,
                         threshold,
                         seeds.len(),
-                        cell_index.grid.bbox_to_cells(qbbox).len()
+                        cell_index.grid.bbox_to_cells(qbbox).len(),
+                        overflow.as_ref().map(|o| o.len()).unwrap_or(0)
                     );
                     let store_type = Self::initialize_spatial_seeded_search(
                         index,
@@ -188,22 +201,7 @@ impl TSVScanState {
         self.distance_fn = Some(distance);
     }
 
-    /// Load SpatialCellIndex from disk.
-    fn load_spatial_cell_index(
-        index: &PgRelation,
-        sci_start: crate::util::ItemPointer,
-    ) -> SpatialCellIndex {
-        let mut stats = WriteStats::default();
-        let mut reader =
-            ChainItemReader::new(index, crate::util::page::PageType::SpatialCellIndex, &mut stats);
-        let mut buf: Vec<u8> = Vec::new();
-        for item in reader.read(sci_start) {
-            buf.extend_from_slice(item.get_data_slice());
-        }
-        SpatialCellIndex::deserialize_from_bytes(&buf)
-    }
-
-    /// Brute-force spatial scan using a pre-loaded cell index.
+    /// Brute-force spatial scan using a pre-loaded cell index (+ optional overflow).
     /// For SBQ storage, reads full vectors from the heap for exact distances.
     fn initialize_spatial_scan_from_index(
         index: &PgRelation,
@@ -212,10 +210,11 @@ impl TSVScanState {
         query: &LabeledVector,
         query_bbox: &BBox2D,
         cell_index: &SpatialCellIndex,
+        overflow: Option<&super::spatial_index::SpatialOverflowIndex>,
         distance_fn: DistanceFn,
         snapshot: pg_sys::Snapshot,
     ) -> StorageState {
-        let node_pointers = cell_index.nodes_in_bbox(query_bbox);
+        let node_pointers = cell_index.nodes_in_bbox_with_overflow(query_bbox, overflow);
         let query_vec_full = query.vec().to_full_slice();
 
         let mut results: Vec<(f32, HeapPointer, IndexPointer)> =

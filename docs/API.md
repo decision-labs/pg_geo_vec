@@ -98,6 +98,7 @@ WITH (num_neighbors = 50, search_list_size = 100, max_alpha = 1.2);
 | `geo_vec.query_search_list_size` | 100 | 1-10000 | Search list size for queries. Higher = better recall, slower. |
 | `geo_vec.query_rescore` | 50 | 0-1000 | Number of candidates rescored with exact distance. 0 disables rescoring. |
 | `geo_vec.spatial_brute_force_threshold` | 5000 | 0-MAX | Candidate count below which brute-force is used instead of hybrid. |
+| `geo_vec.spatial_overflow_compact_threshold` | 10000 | 1–MAX | Overflow postings that trigger CSR compact on insert; VACUUM also compacts when overflow is non-empty |
 | `geo_vec.spatial_seeds_per_cell` | 2 | 1-100 | Seed nodes sampled per grid cell for hybrid spatial search. |
 
 ### Build parameters (superuser only)
@@ -225,22 +226,25 @@ Operator classes (`vector_cosine_ops`, etc.) share names but are scoped per acce
 
 PostGIS registers the `&&` (bounding box overlap) operator for geometry in the **GiST** access method (`gist_geometry_ops_2d`, strategy 3). geo_vec registers the same `&&` operator for geometry in the **geo_vec** access method (`geometry_geo_vec_ops`, strategy 6).
 
-They don't conflict because PostgreSQL's operator class system is **scoped per access method**. The planner picks which index to use based on what the query needs:
+They don't conflict because PostgreSQL's operator class system is **scoped per access method**. For spatial+vector queries, the planner compares path costs. geo_vec’s `amcostestimate` uses spatial-qual selectivity, LIMIT, and brute/hybrid/graph work estimates so selective bboxes favor the rich index (see [ARCHITECTURE — Planner Cost Estimation](ARCHITECTURE.md#planner-cost-estimation) and [README benchmarks](../README.md#benchmarks)).
 
 ```sql
 -- Both indexes on the same table
 CREATE INDEX buildings_gist_idx ON buildings USING gist (geom);
+CREATE INDEX buildings_hnsw_idx ON buildings USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX buildings_geo_vec_idx ON buildings USING geo_vec (embedding vector_cosine_ops, geom);
 
 -- Pure spatial query → planner picks GiST (PostGIS)
 SELECT id FROM buildings
 WHERE geom && ST_MakeEnvelope(-117.598, 47.651, -117.586, 47.655, 4326);
 
--- Spatial + vector query → planner picks geo_vec (single index scan)
+-- Spatial + vector query → planner compares geo_vec vs HNSW(+GiST)
+-- Selective bbox: expect Index Scan using …geo_vec…
+EXPLAIN (COSTS)
 SELECT id FROM buildings
 WHERE geom && ST_MakeEnvelope(-117.598, 47.651, -117.586, 47.655, 4326)
 ORDER BY embedding <=> query_vec
 LIMIT 20;
 ```
 
-The `&&` operator is the same PostGIS function in both cases — the routing is determined by which access method's operator class claims it in `pg_amop`.
+The `&&` operator is the same PostGIS function in both cases — the routing is determined by which access method's operator class claims it in `pg_amop`, and which path wins on cost.

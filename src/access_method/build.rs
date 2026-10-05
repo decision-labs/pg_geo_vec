@@ -17,6 +17,7 @@ use crate::access_method::stats::{InsertStats, WriteStats};
 use crate::util::ports::acquire_index_lock;
 
 use crate::access_method::spatial_index::{SpatialCellIndexBuilder, SpatialGridConfig};
+use crate::access_method::spatial_maintain;
 use crate::access_method::GEO_VEC_DISTANCE_TYPE_PROC;
 use crate::partition::postgis::{ensure_postgis_loaded, postgis_extract_bbox};
 use crate::partition::BBox2D;
@@ -607,6 +608,9 @@ unsafe fn insert_storage<S: Storage>(
 
     let mut graph = Graph::new(GraphNeighborStore::Disk, meta_page);
     graph.insert(index_relation, index_pointer, vector, storage, stats);
+
+    // Keep spatial CSR current for bbox queries (overflow append or create CSR).
+    spatial_maintain::maintain_spatial_on_insert(index_relation, meta_page, index_pointer, &bbox);
 }
 
 #[pg_guard]
@@ -1022,6 +1026,7 @@ fn finalize_index_build<S: Storage>(
             ChainTapeWriter::new(index_relation, PageType::SpatialCellIndex, &mut write_stats);
         let start_ip = tape.write(&bytes);
         meta_page.set_spatial_cell_index_start(start_ip);
+        meta_page.clear_spatial_overflow();
 
         notice!(
             "Built spatial cell index: {} cells, {} entries",
@@ -1062,6 +1067,22 @@ fn build_spatial_index_from_graph(
     index_relation: &PgRelation,
     meta_page: &mut MetaPage,
 ) {
+    rebuild_spatial_cell_index_from_graph(index_relation, meta_page);
+}
+
+/// Rebuild base CSR from the live graph and clear the overflow segment.
+/// Used after parallel build, on overflow compact, and on VACUUM.
+pub(crate) fn compact_spatial_cell_index(
+    index_relation: &PgRelation,
+    meta_page: &mut MetaPage,
+) {
+    rebuild_spatial_cell_index_from_graph(index_relation, meta_page);
+}
+
+fn rebuild_spatial_cell_index_from_graph(
+    index_relation: &PgRelation,
+    meta_page: &mut MetaPage,
+) {
     if !meta_page.has_geometry() {
         return;
     }
@@ -1093,6 +1114,9 @@ fn build_spatial_index_from_graph(
             StorageType::SbqCompression => {
                 let rn = unsafe { SbqNode::read(index_relation, ip, has_labels, &mut stats) };
                 let node = rn.get_archived_node();
+                if node.is_deleted() {
+                    continue;
+                }
                 let bbox = node.get_bbox();
                 let neighbors: Vec<ItemPointer> = node.get_index_pointer_to_neighbors();
                 (bbox, neighbors)
@@ -1100,6 +1124,9 @@ fn build_spatial_index_from_graph(
             StorageType::Plain => {
                 let rn = unsafe { PlainNode::read(index_relation, ip, &mut stats) };
                 let node = rn.get_archived_node();
+                if node.is_deleted() {
+                    continue;
+                }
                 let bbox = BBox2D {
                     xmin: node.bbox.xmin,
                     xmax: node.bbox.xmax,
@@ -1145,6 +1172,7 @@ fn build_spatial_index_from_graph(
         ChainTapeWriter::new(index_relation, PageType::SpatialCellIndex, &mut write_stats);
     let start_ip = tape.write(&bytes);
     meta_page.set_spatial_cell_index_start(start_ip);
+    meta_page.clear_spatial_overflow();
 
     notice!(
         "Built spatial cell index: {} cells, {} entries (post-parallel)",

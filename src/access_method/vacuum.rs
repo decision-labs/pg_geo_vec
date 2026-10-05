@@ -10,6 +10,7 @@ use crate::{
         plain::storage::PlainStorage,
         sbq::node::{ArchivedClassicSbqNode, ArchivedLabeledSbqNode},
         sbq::storage::SbqSpeedupStorage,
+        spatial_maintain,
     },
     util::{
         page::WritablePage,
@@ -151,6 +152,13 @@ pub extern "C-unwind" fn amvacuumcleanup(
             index_relation.as_ptr(),
             pg_sys::ForkNumber::MAIN_FORKNUM,
         );
+
+        // Merge spatial overflow into base CSR so deletes/inserts stay queryable
+        // without unbounded overflow growth.
+        if MetaPage::fetch(&index_relation).has_geometry() {
+            let mut meta = MetaPage::fetch(&index_relation);
+            spatial_maintain::maybe_compact_spatial_on_vacuum(&index_relation, &mut meta);
+        }
 
         stats
     }

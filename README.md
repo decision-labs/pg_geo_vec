@@ -81,17 +81,45 @@ The threshold is controlled by `geo_vec.spatial_brute_force_threshold` (default:
 
 ## Benchmarks
 
-**318K rows, 384-dim vectors, cosine distance:**
+**Kigoto: 318K rows, 384-dim vectors, cosine distance** (warm `EXPLAIN ANALYZE`, PG17):
 
-| Query | Path | Recall | Latency |
-|---|---|---|---|
-| Tiny bbox (~1K candidates) | Brute-force | 20/20 | 65ms |
-| Narrow bbox (~20K candidates) | Hybrid | 20/20 | 99ms |
-| Wide bbox (~180K candidates) | Hybrid | 20/20 | 61ms |
-| Pure vector | Graph | 20/20 | 37ms |
-| Wide bbox (forced brute-force) | Brute-force | 20/20 | 499ms |
+| Query | Path | geo_vec recall | geo_vec latency | HNSW+GiST recall |
+|---|---|---|---|---|
+| Tiny bbox (~1–2K candidates) | Brute-force | 20/20 | ~40ms | — |
+| Narrow bbox (~20K candidates) | Hybrid | 20/20 | ~45ms | **0/20** |
+| Medium bbox (~70K candidates) | Hybrid | 20/20 | ~41ms | **1/20** |
+| Wide bbox (~180K / ≈57% of rows) | Hybrid | 20/20 | ~40ms | 20/20 |
+| Pure vector | Graph | 20/20 | ~26ms | 20/20 |
 
-Hybrid search is **8x faster** than brute-force on large bounding boxes while maintaining the same recall.
+On selective filters (narrow/medium), HNSW+GiST is fast but **recall collapses**; geo_vec keeps 20/20. On a very wide bbox (~57% of the table), both can hit 20/20 and effective QPS may favor HNSW — the planner should not blindly always pick geo_vec (see below).
+
+**Buildings: ~8.5K rows** — geo_vec and HNSW+GiST both reach 20/20 on the same bbox suite (small enough that HNSW+GiST remains accurate).
+
+### Planner cardinality (index choice)
+
+When **geo_vec**, **HNSW**, and **GiST** all exist on the same table, Postgres picks a path using `amcostestimate`. geo_vec’s cost model uses spatial-qual selectivity (`clauselist_selectivity`), LIMIT, and the brute/hybrid/graph routing thresholds — not a flat `n/100` heuristic.
+
+Measured on Kigoto with competing indexes on one table (`kigoto_planner`):
+
+| Bbox | Before (`numIndexTuples = n/100`) | After (spatial + LIMIT-aware) |
+|---|---|---|
+| tiny | **geo_vec** (cost ~3335) | **geo_vec** (cost ~248) |
+| narrow | HNSW (cost ~1413) | **geo_vec** (cost ~179) |
+| medium | HNSW (cost ~963) | **geo_vec** (cost ~234) |
+| wide | HNSW (cost ~850) | **geo_vec** (cost ~307) |
+
+After the change, estimated geo_vec cost **rises with bbox width** (narrow → wide), and the planner prefers the rich index on selective queries where recall matters. Wide still picking geo_vec may be aggressive vs effective-QPS; treat as a tunable signal (issue [#4](https://github.com/decision-labs/pg_geo_vec/issues/4)).
+
+Reproduce:
+
+```bash
+make bench-kigoto              # recall / latency (separate tables per AM)
+make bench-planner-choice      # EXPLAIN choice with competing indexes
+# optional: before/after amcostestimate A/B
+bash test_data/run_planner_before_after.sh   # inside geo_vec_test:pg17 container
+```
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#planner-cost-estimation) for how `amcostestimate` works.
 
 ## pgvectorscale Coexistence
 
@@ -110,8 +138,8 @@ CREATE INDEX idx_diskann ON places USING diskann (embedding vector_cosine_ops);
 
 - [Quick Start Guide](docs/QUICKSTART.md) — installation, setup, first queries
 - [API Reference](docs/API.md) — operator classes, GUC parameters, helper functions
-- [Architecture](docs/ARCHITECTURE.md) — internals, index build, query routing, storage
-- [Roadmap](docs/ROADMAP.md) — planned improvements
+- [Architecture](docs/ARCHITECTURE.md) — internals, index build, query routing, planner costs, storage
+- [Roadmap](docs/ROADMAP.md) — planned work and **what will move performance most**
 
 ## Development
 

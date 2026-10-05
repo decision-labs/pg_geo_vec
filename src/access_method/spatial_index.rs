@@ -3,6 +3,10 @@
 //! A grid-based auxiliary structure mapping spatial cells to node IndexPointers.
 //! Built during index creation and stored in chained pages (CSR format).
 //!
+//! Inserts after `CREATE INDEX` append to a separate overflow segment (same grid)
+//! so new nodes are visible to spatial brute/hybrid without a full CSR rewrite.
+//! `VACUUM` / compact merges overflow back into a single CSR.
+//!
 //! For queries with a bbox filter, the spatial cell index provides 100% spatial
 //! recall by finding all nodes in overlapping cells, computing vector distances,
 //! and returning top-K results.
@@ -158,14 +162,63 @@ impl SpatialCellIndex {
         query_bbox: &BBox2D,
         max_per_cell: usize,
     ) -> (Vec<ItemPointer>, usize) {
+        self.sample_seeds_in_bbox_with_overflow(query_bbox, max_per_cell, None)
+    }
+
+    /// Like [`nodes_in_bbox`] but unions postings from an optional overflow segment.
+    pub fn nodes_in_bbox_with_overflow(
+        &self,
+        query_bbox: &BBox2D,
+        overflow: Option<&SpatialOverflowIndex>,
+    ) -> Vec<ItemPointer> {
+        let cells = self.grid.bbox_to_cells(query_bbox);
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for &cell_idx in &cells {
+            let start = self.cell_offsets[cell_idx] as usize;
+            let end = self.cell_offsets[cell_idx + 1] as usize;
+            for &ip in &self.node_pointers[start..end] {
+                if seen.insert(ip) {
+                    result.push(ip);
+                }
+            }
+        }
+        if let Some(ov) = overflow {
+            for ip in ov.nodes_in_cells(&cells) {
+                if seen.insert(ip) {
+                    result.push(ip);
+                }
+            }
+        }
+        result
+    }
+
+    /// Like [`sample_seeds_in_bbox`] with overflow postings included in counts/seeds.
+    pub fn sample_seeds_in_bbox_with_overflow(
+        &self,
+        query_bbox: &BBox2D,
+        max_per_cell: usize,
+        overflow: Option<&SpatialOverflowIndex>,
+    ) -> (Vec<ItemPointer>, usize) {
         let cells = self.grid.bbox_to_cells(query_bbox);
         let mut seeds = Vec::new();
         let mut total_count: usize = 0;
+        let mut seen_seeds = HashSet::new();
 
-        for cell_idx in cells {
+        for &cell_idx in &cells {
             let start = self.cell_offsets[cell_idx] as usize;
             let end = self.cell_offsets[cell_idx + 1] as usize;
-            let cell_len = end - start;
+            let mut cell_ptrs: Vec<ItemPointer> = self.node_pointers[start..end].to_vec();
+            if let Some(ov) = overflow {
+                for ip in ov.nodes_in_cell(cell_idx) {
+                    cell_ptrs.push(ip);
+                }
+            }
+            // Dedup within cell for counting (multi-cell overflow may repeat)
+            let mut cell_seen = HashSet::new();
+            cell_ptrs.retain(|ip| cell_seen.insert(*ip));
+
+            let cell_len = cell_ptrs.len();
             total_count += cell_len;
 
             if cell_len == 0 {
@@ -173,12 +226,18 @@ impl SpatialCellIndex {
             }
 
             if cell_len <= max_per_cell {
-                seeds.extend_from_slice(&self.node_pointers[start..end]);
+                for ip in cell_ptrs {
+                    if seen_seeds.insert(ip) {
+                        seeds.push(ip);
+                    }
+                }
             } else {
-                // Evenly-spaced sampling
                 for i in 0..max_per_cell {
-                    let idx = start + i * cell_len / max_per_cell;
-                    seeds.push(self.node_pointers[idx]);
+                    let idx = i * cell_len / max_per_cell;
+                    let ip = cell_ptrs[idx];
+                    if seen_seeds.insert(ip) {
+                        seeds.push(ip);
+                    }
                 }
             }
         }
@@ -192,6 +251,66 @@ impl SpatialCellIndex {
     }
 
     /// Deserialize from bytes via rkyv.
+    pub fn deserialize_from_bytes(bytes: &[u8]) -> Self {
+        unsafe { rkyv::from_bytes_unchecked::<Self>(bytes).unwrap() }
+    }
+}
+
+/// Append-only overflow postings for nodes inserted after the base CSR was built.
+///
+/// Uses the same grid as the base index; cell IDs are absolute indices into that grid.
+/// Stored as its own ChainTape blob (`PageType::SpatialOverflow`).
+#[derive(Clone, Debug, PartialEq, Default, Archive, Deserialize, Serialize)]
+pub struct SpatialOverflowIndex {
+    pub cell_ids: Vec<u32>,
+    pub node_pointers: Vec<ItemPointer>,
+}
+
+impl SpatialOverflowIndex {
+    pub fn len(&self) -> usize {
+        self.node_pointers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_pointers.is_empty()
+    }
+
+    /// Append a node into every cell its bbox overlaps (same rule as CSR build).
+    pub fn append_node(&mut self, grid: &SpatialGridConfig, index_pointer: ItemPointer, bbox: &BBox2D) {
+        if bbox.is_empty() {
+            return;
+        }
+        for cell_idx in grid.bbox_to_cells(bbox) {
+            self.cell_ids.push(cell_idx as u32);
+            self.node_pointers.push(index_pointer);
+        }
+    }
+
+    pub fn nodes_in_cell(&self, cell_idx: usize) -> Vec<ItemPointer> {
+        let cell_idx = cell_idx as u32;
+        self.cell_ids
+            .iter()
+            .zip(self.node_pointers.iter())
+            .filter_map(|(c, ip)| if *c == cell_idx { Some(*ip) } else { None })
+            .collect()
+    }
+
+    pub fn nodes_in_cells(&self, cells: &[usize]) -> Vec<ItemPointer> {
+        let want: HashSet<u32> = cells.iter().map(|&c| c as u32).collect();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (c, ip) in self.cell_ids.iter().zip(self.node_pointers.iter()) {
+            if want.contains(c) && seen.insert(*ip) {
+                out.push(*ip);
+            }
+        }
+        out
+    }
+
+    pub fn serialize_to_bytes(&self) -> Vec<u8> {
+        rkyv::to_bytes::<_, 4096>(self).unwrap().to_vec()
+    }
+
     pub fn deserialize_from_bytes(bytes: &[u8]) -> Self {
         unsafe { rkyv::from_bytes_unchecked::<Self>(bytes).unwrap() }
     }
@@ -606,4 +725,30 @@ mod tests {
             "nodes_in_bbox should deduplicate"
         );
     }
+    #[test]
+    fn overflow_append_and_union() {
+        let extent = BBox2D::new(0.0, 10.0, 0.0, 10.0);
+        let grid = SpatialGridConfig::from_extent(extent, 400);
+        let mut builder = SpatialCellIndexBuilder::new(grid.clone());
+        let ip0 = ItemPointer::new(1, 1);
+        builder.add(ip0, &BBox2D::new(1.0, 1.0, 1.0, 1.0));
+        let base = builder.build();
+
+        let mut ov = SpatialOverflowIndex::default();
+        let ip1 = ItemPointer::new(2, 1);
+        ov.append_node(&base.grid, ip1, &BBox2D::new(5.0, 5.0, 5.0, 5.0));
+        assert!(!ov.is_empty());
+
+        let q = BBox2D::new(4.0, 6.0, 4.0, 6.0);
+        let without = base.nodes_in_bbox(&q);
+        let with = base.nodes_in_bbox_with_overflow(&q, Some(&ov));
+        assert!(!with.contains(&ip1) || with.iter().any(|p| *p == ip1));
+        assert!(with.len() >= without.len());
+        assert!(with.iter().any(|p| *p == ip1), "overflow node must be visible");
+
+        let (_seeds, count) = base.sample_seeds_in_bbox_with_overflow(&q, 2, Some(&ov));
+        let (_s2, count0) = base.sample_seeds_in_bbox(&q, 2);
+        assert!(count >= count0);
+    }
+
 }

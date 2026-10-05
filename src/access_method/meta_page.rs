@@ -21,7 +21,7 @@ use crate::util::page::{self, PageType};
 use crate::util::*;
 
 const TSV_MAGIC_NUMBER: u32 = 768756476; //Magic number, random
-const TSV_VERSION: u32 = 3;
+const TSV_VERSION: u32 = 4;
 const GRAPH_SLACK_FACTOR: f64 = 1.3_f64;
 
 const META_BLOCK_NUMBER: pg_sys::BlockNumber = 0;
@@ -90,6 +90,8 @@ impl From<&MetaPageV1> for MetaPage {
             has_geometry: false,
             label_attr_idx: None,
             spatial_cell_index_start: None,
+            spatial_overflow_start: None,
+            spatial_overflow_entries: 0,
         }
     }
 }
@@ -164,6 +166,8 @@ impl From<MetaPageV2> for MetaPage {
             has_geometry: false,
             label_attr_idx: None,
             spatial_cell_index_start: None,
+            spatial_overflow_start: None,
+            spatial_overflow_entries: 0,
         }
     }
 }
@@ -219,6 +223,10 @@ pub struct MetaPage {
     label_attr_idx: Option<u8>,
     /// Start pointer for the spatial cell index (invalid = no spatial index)
     spatial_cell_index_start: Option<ItemPointer>,
+    /// Start pointer for append-only spatial overflow (inserts after CSR build)
+    spatial_overflow_start: Option<ItemPointer>,
+    /// Number of overflow posting entries (cell,pointer pairs) since last compact
+    spatial_overflow_entries: u32,
 }
 
 impl MetaPage {
@@ -285,6 +293,27 @@ impl MetaPage {
 
     pub fn set_spatial_cell_index_start(&mut self, ip: ItemPointer) {
         self.spatial_cell_index_start = Some(ip);
+    }
+
+    pub fn get_spatial_overflow_start(&self) -> Option<ItemPointer> {
+        self.spatial_overflow_start.filter(|ip| ip.is_valid())
+    }
+
+    pub fn set_spatial_overflow_start(&mut self, ip: ItemPointer) {
+        self.spatial_overflow_start = Some(ip);
+    }
+
+    pub fn clear_spatial_overflow(&mut self) {
+        self.spatial_overflow_start = None;
+        self.spatial_overflow_entries = 0;
+    }
+
+    pub fn get_spatial_overflow_entries(&self) -> u32 {
+        self.spatial_overflow_entries
+    }
+
+    pub fn set_spatial_overflow_entries(&mut self, n: u32) {
+        self.spatial_overflow_entries = n;
     }
 
     pub fn get_start_nodes(&self) -> Option<&StartNodes> {
@@ -398,6 +427,8 @@ impl MetaPage {
             has_geometry,
             label_attr_idx,
             spatial_cell_index_start: None,
+            spatial_overflow_start: None,
+            spatial_overflow_entries: 0,
         };
 
         meta.store(index, true);
